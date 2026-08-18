@@ -1,0 +1,12 @@
+[workspace]
+members = ["rust/ahc-ml", "examples/mnist/rust"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

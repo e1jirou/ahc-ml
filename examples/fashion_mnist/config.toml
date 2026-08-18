@@ -1,0 +1,28 @@
+[run]
+seed = 0
+device = "auto"
+deterministic = false
+output_dir = "outputs/fashion_mnist"
+
+[data]
+dataset = "fashion_mnist"
+root = "data/fashion_mnist"
+batch_size = 256
+num_workers = 4
+
+[model]
+channels = [32, 64]
+hidden_size = 128
+
+[optimizer]
+name = "adamw"
+learning_rate = 0.001
+weight_decay = 0.0001
+
+[training]
+epochs = 10
+
+[wandb]
+project = "ahc-ml"
+entity = ""
+mode = "online"
