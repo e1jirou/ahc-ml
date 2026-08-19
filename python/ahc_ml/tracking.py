@@ -44,7 +44,11 @@ class WandbTracker:
     def log_image(self, path: str | Path, *, key: str, caption: str | None = None) -> None:
         """Log an image to the run workspace."""
         if self._run is not None and self._mode != "disabled":
-            self._run.log({key: self._wandb.Image(str(path), caption=caption)})
+            self._run.log(
+                {key: self._wandb.Image(str(path), caption=caption)},
+                step=0,
+                commit=False,
+            )
 
     def log_artifact(self, path: str | Path, *, name: str, artifact_type: str) -> None:
         if self._run is None:

@@ -162,7 +162,8 @@ scripts/build_submit.sh path/to/main.rs dist/ahcXXX.rs
 ```
 
 外部crateは展開されません。提出コードで使う外部crateはAtCoderのRust環境にあるものに限ります。
-ビルド時には、展開前のソースがAtCoderの提出上限である512 KiBを超えていないことも確認します。
+ビルド時には、minify後の実際の提出ソースがAtCoderの提出上限である512 KiBを超えていないことも
+確認します。
 minifyは識別子名を変更しないため、外部crateを含むRustの名前解決を壊しません。
 
 ## 開発

@@ -1,5 +1,5 @@
 [workspace]
-members = ["rust/ahc-ml", "examples/mnist/rust"]
+members = ["rust/ahc-ml", "examples/mnist/rust", "examples/ahc015/rust"]
 resolver = "2"
 
 [workspace.package]

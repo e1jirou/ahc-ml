@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ahc015-inference"
+version = "0.1.0"
+dependencies = [
+ "ahc-ml",
+ "ndarray",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

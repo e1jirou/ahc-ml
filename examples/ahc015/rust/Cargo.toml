@@ -1,0 +1,9 @@
+[package]
+name = "ahc015-inference"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ahc-ml = { path = "../../../rust/ahc-ml" }
+ndarray = "0.16.1"

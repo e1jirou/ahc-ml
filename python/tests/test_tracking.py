@@ -9,9 +9,11 @@ from ahc_ml.tracking import WandbTracker
 class FakeRun:
     def __init__(self) -> None:
         self.log_calls: list[dict[str, object]] = []
+        self.log_options: list[dict[str, object]] = []
 
-    def log(self, values: dict[str, object]) -> None:
+    def log(self, values: dict[str, object], **options: object) -> None:
         self.log_calls.append(values)
+        self.log_options.append(options)
 
 
 def test_log_image_adds_an_image_to_the_run(monkeypatch, tmp_path) -> None:
@@ -34,6 +36,7 @@ def test_log_image_adds_an_image_to_the_run(monkeypatch, tmp_path) -> None:
     tracker.log_image(image_path, key="model/architecture", caption="Model graph")
 
     assert run.log_calls == [{"model/architecture": (str(image_path), "Model graph")}]
+    assert run.log_options == [{"step": 0, "commit": False}]
 
 
 def test_log_image_is_skipped_when_wandb_is_disabled(monkeypatch, tmp_path) -> None:
