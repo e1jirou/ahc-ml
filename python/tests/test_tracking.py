@@ -58,3 +58,22 @@ def test_log_image_is_skipped_when_wandb_is_disabled(monkeypatch, tmp_path) -> N
     tracker.log_image(tmp_path / "model.png", key="model/architecture")
 
     assert run.log_calls == []
+
+
+def test_log_artifact_is_skipped_when_wandb_is_disabled(monkeypatch, tmp_path) -> None:
+    run = FakeRun()
+    fake_wandb = SimpleNamespace(
+        init=lambda **_kwargs: run,
+        Artifact=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not be called")),
+    )
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    tracker = WandbTracker(
+        project="test",
+        entity=None,
+        mode="disabled",
+        name="test-run",
+        config={},
+        directory=tmp_path,
+    )
+
+    tracker.log_artifact(tmp_path / "model.pt", name="model", artifact_type="model")

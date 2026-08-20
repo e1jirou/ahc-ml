@@ -69,3 +69,40 @@ class Ahc015ValueNet(nn.Module):
 
 def parameter_count(model: nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
+
+
+class Ahc015PpoNet(nn.Module):
+    """Actor residual and a permutation-invariant critic over four afterstates."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.actor = Ahc015ValueNet()
+        self.critic = Ahc015ValueNet()
+
+    def policy_logits(
+        self,
+        candidate_features: torch.Tensor,
+        candidate_potentials: torch.Tensor,
+        logit_scale: float,
+    ) -> torch.Tensor:
+        batch_size, action_count = candidate_features.shape[:2]
+        residuals = self.actor(candidate_features.flatten(0, 1)).reshape(batch_size, action_count)
+        return logit_scale * (candidate_potentials + residuals)
+
+    def state_values(self, candidate_features: torch.Tensor) -> torch.Tensor:
+        batch_size, action_count = candidate_features.shape[:2]
+        action_values = self.critic(candidate_features.flatten(0, 1)).reshape(
+            batch_size, action_count
+        )
+        return action_values.mean(dim=1)
+
+    def forward(
+        self,
+        candidate_features: torch.Tensor,
+        candidate_potentials: torch.Tensor,
+        logit_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self.policy_logits(candidate_features, candidate_potentials, logit_scale),
+            self.state_values(candidate_features),
+        )

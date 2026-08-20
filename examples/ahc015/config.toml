@@ -6,35 +6,26 @@ output_dir = "outputs/ahc015"
 experiment_log = "examples/ahc015/docs/experiments.md"
 
 [training]
-iterations = 300
+iterations = 1000
 rollout_episodes = 32
-updates_per_iteration = 100
-batch_size = 128
-learning_rate = 0.0003
+epochs = 4
+batch_size = 256
+learning_rate = 0.0001
 weight_decay = 0.0001
-gradient_clip_norm = 5.0
-target_update_interval = 1000
+gradient_clip_norm = 1.0
 checkpoint_interval = 5
 max_hours = 10.0
-
-[exploration]
-epsilon_start = 0.20
-epsilon_end = 0.02
-epsilon_decay_iterations = 80
-
-[replay]
-capacity = 200000
-minimum_size = 10000
-
-[backup]
-placement_samples = 8
-enumerate_threshold = 16
 inference_batch_size = 4096
-mc_beta_start = 0.50
-mc_beta_end = 0.0
-mc_beta_decay_iterations = 50
-minimum_placed_start = 80
-curriculum_iterations = 30
+
+[ppo]
+gamma = 1.0
+gae_lambda = 0.95
+clip_ratio = 0.2
+value_clip = 0.2
+value_coefficient = 0.5
+entropy_coefficient = 0.01
+logit_scale = 12.0
+target_kl = 0.03
 
 [evaluation]
 interval = 5

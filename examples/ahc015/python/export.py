@@ -11,7 +11,7 @@ from .model import PARAMETER_COUNT, Ahc015ValueNet, parameter_count
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export the AHC015 value model for Rust")
+    parser = argparse.ArgumentParser(description="Export the AHC015 PPO actor for Rust")
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--output", type=Path, default=Path("outputs/ahc015/model.bin"))
     parser.add_argument(
@@ -38,7 +38,8 @@ def main() -> None:
         load_checkpoint(args.checkpoint, model=model)
 
     metadata = {
-        "architecture": "ahc015-afterstate-value-144x9-v1",
+        "architecture": "ahc015-ppo-actor-144x9-v1",
+        "training_algorithm": "ppo",
         "channels": 144,
         "residual_blocks": 9,
         "parameter_count": PARAMETER_COUNT,

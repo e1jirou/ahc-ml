@@ -1,1 +1,1 @@
-"""AHC015 afterstate reinforcement-learning example."""
+"""AHC015 PPO reinforcement-learning example."""

@@ -19,39 +19,26 @@ class RunConfig:
 class TrainingConfig:
     iterations: int
     rollout_episodes: int
-    updates_per_iteration: int
+    epochs: int
     batch_size: int
     learning_rate: float
     weight_decay: float
     gradient_clip_norm: float
-    target_update_interval: int
     checkpoint_interval: int
     max_hours: float
-
-
-@dataclass(frozen=True)
-class ExplorationConfig:
-    epsilon_start: float
-    epsilon_end: float
-    epsilon_decay_iterations: int
-
-
-@dataclass(frozen=True)
-class ReplayConfig:
-    capacity: int
-    minimum_size: int
-
-
-@dataclass(frozen=True)
-class BackupConfig:
-    placement_samples: int
-    enumerate_threshold: int
     inference_batch_size: int
-    mc_beta_start: float
-    mc_beta_end: float
-    mc_beta_decay_iterations: int
-    minimum_placed_start: int
-    curriculum_iterations: int
+
+
+@dataclass(frozen=True)
+class PpoConfig:
+    gamma: float
+    gae_lambda: float
+    clip_ratio: float
+    value_clip: float
+    value_coefficient: float
+    entropy_coefficient: float
+    logit_scale: float
+    target_kl: float
 
 
 @dataclass(frozen=True)
@@ -72,9 +59,7 @@ class WandbConfig:
 class Ahc015Config:
     run: RunConfig
     training: TrainingConfig
-    exploration: ExplorationConfig
-    replay: ReplayConfig
-    backup: BackupConfig
+    ppo: PpoConfig
     evaluation: EvaluationConfig
     wandb: WandbConfig
 
@@ -93,36 +78,36 @@ def load_config(path: str | Path) -> Ahc015Config:
     config = Ahc015Config(
         run=RunConfig(**values["run"]),
         training=TrainingConfig(**values["training"]),
-        exploration=ExplorationConfig(**values["exploration"]),
-        replay=ReplayConfig(**values["replay"]),
-        backup=BackupConfig(**values["backup"]),
+        ppo=PpoConfig(**values["ppo"]),
         evaluation=EvaluationConfig(**values["evaluation"]),
         wandb=WandbConfig(**values["wandb"]),
     )
     for name, value in (
         ("training.iterations", config.training.iterations),
         ("training.rollout_episodes", config.training.rollout_episodes),
-        ("training.updates_per_iteration", config.training.updates_per_iteration),
+        ("training.epochs", config.training.epochs),
         ("training.batch_size", config.training.batch_size),
         ("training.learning_rate", config.training.learning_rate),
-        ("training.target_update_interval", config.training.target_update_interval),
+        ("training.gradient_clip_norm", config.training.gradient_clip_norm),
+        ("training.checkpoint_interval", config.training.checkpoint_interval),
         ("training.max_hours", config.training.max_hours),
-        ("replay.capacity", config.replay.capacity),
-        ("replay.minimum_size", config.replay.minimum_size),
-        ("backup.placement_samples", config.backup.placement_samples),
-        ("backup.inference_batch_size", config.backup.inference_batch_size),
+        ("training.inference_batch_size", config.training.inference_batch_size),
+        ("ppo.gae_lambda", config.ppo.gae_lambda),
+        ("ppo.clip_ratio", config.ppo.clip_ratio),
+        ("ppo.value_clip", config.ppo.value_clip),
+        ("ppo.value_coefficient", config.ppo.value_coefficient),
+        ("ppo.logit_scale", config.ppo.logit_scale),
+        ("ppo.target_kl", config.ppo.target_kl),
         ("evaluation.interval", config.evaluation.interval),
         ("evaluation.episodes", config.evaluation.episodes),
     ):
         _positive(name, value)
-    if config.replay.minimum_size > config.replay.capacity:
-        raise ValueError("replay.minimum_size must not exceed replay.capacity")
-    if not 0 <= config.exploration.epsilon_end <= config.exploration.epsilon_start <= 1:
-        raise ValueError("exploration epsilons must satisfy 0 <= end <= start <= 1")
-    if not 0 <= config.backup.mc_beta_end <= config.backup.mc_beta_start <= 1:
-        raise ValueError("backup MC beta must satisfy 0 <= end <= start <= 1")
-    if not 1 <= config.backup.minimum_placed_start <= 99:
-        raise ValueError("backup.minimum_placed_start must be in 1..=99")
+    if config.ppo.gamma != 1.0:
+        raise ValueError("ppo.gamma must be 1.0 so potential shaping preserves the objective")
+    if not 0 < config.ppo.gae_lambda <= 1:
+        raise ValueError("ppo.gae_lambda must be in (0, 1]")
+    if config.ppo.entropy_coefficient < 0:
+        raise ValueError("ppo.entropy_coefficient must be non-negative")
     if config.wandb.mode not in {"online", "offline", "disabled"}:
         raise ValueError("wandb.mode must be online, offline, or disabled")
     return config

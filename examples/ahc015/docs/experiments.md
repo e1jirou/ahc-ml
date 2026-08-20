@@ -319,3 +319,42 @@
   `1e-4`は候補に残すが、平均80万へ向けた性能改善策としてこのまま延長はしない
 - 後片付け: 専用configとoptimizer reset用の実験コードは削除。再検証時はcheckpointからoptimizerを
   復元するとparam groupのlearning rateも`3e-4`へ戻るため、modelだけを読み込んでoptimizerを作り直す
+
+## ppo-20260820-010211
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260820-010211`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15015
+- wall-clock limit: 10.000 hours
+- W&B: online, run ID `bg1dyojk`
+- status: time limit reached
+- elapsed: 10.009 hours
+- updates: 43069
+- best paired gain: 355768.855
+- 完走確認: 835 iteration、43,069 update、実学習10.009時間。MPSとW&B onlineは正常
+- 固定512ケースbest: iteration 789（経過9.468時間）、平均704,181.885、`Phi`貪欲比
+  +355,768.855 ±5,086.411（標準誤差）、勝率99.61%
+- 最終固定評価: iteration 834、平均689,164.775、`Phi`貪欲比+340,751.746 ±5,550.082、
+  勝率98.44%
+- 最後20回の固定評価: 平均685,794.324、標準偏差7,766、range 35,614、隣接評価間の
+  平均絶対変動8,563（最大21,981）。従来のafterstate学習より評価推移はかなり安定している
+- 独立評価: 2,000件、seed `20260825`（学習、best選択、過去の独立評価には未使用）
+- PPO best: 平均698,013.299、`Phi`貪欲比+349,543.198 ±2,777.774、勝率99.55%
+- 従来採用hard版best: 平均607,949.975、`Phi`貪欲比+259,479.873 ±2,629.162、勝率97.45%
+- 同一ケース上の平均差: PPO − 従来採用モデル = +90,063.325点
+- 判断: best選択seed外でも約9万点改善しており、PPOは明確に有効。現時点の学習済みモデルとして
+  PPO bestを優先候補とする。ただし目標の平均80万には約10.2万点届かず、Rust int8版の一致と性能を
+  確認してから提出モデルを置き換える
+- 採用: PPOを主方式とし、旧Bellman/replay学習コードは削除。提出埋め込み重みもこのPPO bestへ更新する
+- 停滞分析: iteration 199の固定平均665,252に対しbestはiteration 789の704,182。iteration 200以降は
+  entropy平均0.395、clip fraction平均13.5%、KL early stop率54.5%。次はrollout episodeを32から128へ
+  増やす大batch PPOを最優先で比較する
+- Rust int8独立評価: 同じ2,000件、平均693,493.287、`Phi`貪欲比+345,023.186 ±2,794.422、
+  勝率99.30%。floatとの差は-4,520.012 ±2,140.017、公式スコア完全一致率27.60%。量子化損失は
+  小さいが有意な可能性があるため、今後per-channel量子化を検討する
+- Rustローカル速度: seed `15015`、warmup 2回後10回。平均0.575秒、median 0.561秒、
+  min 0.557秒、max 0.694秒
+- 提出ソース: 493,655 bytes、SHA-256
+  `958e5ff76707efa90360f5c3a263da9e3bf8063fcbae713c0a8d4982fe34d233`

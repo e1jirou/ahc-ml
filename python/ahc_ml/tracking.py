@@ -51,7 +51,7 @@ class WandbTracker:
             )
 
     def log_artifact(self, path: str | Path, *, name: str, artifact_type: str) -> None:
-        if self._run is None:
+        if self._run is None or self._mode == "disabled":
             return
         artifact = self._wandb.Artifact(name=name, type=artifact_type)
         artifact.add_file(str(path))

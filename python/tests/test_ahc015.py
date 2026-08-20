@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from examples.ahc015.python.backup import bellman_residual_targets
 from examples.ahc015.python.config import load_config
 from examples.ahc015.python.features import (
     FEATURE_CHANNELS,
@@ -27,9 +26,18 @@ from examples.ahc015.python.game import (
     place_at_rank,
     tilt,
 )
-from examples.ahc015.python.model import PARAMETER_COUNT, Ahc015ValueNet, parameter_count
-from examples.ahc015.python.replay import ReplayBatch, ReplayBuffer
-from examples.ahc015.python.simulation import collect_rollouts
+from examples.ahc015.python.model import (
+    PARAMETER_COUNT,
+    Ahc015PpoNet,
+    Ahc015ValueNet,
+    parameter_count,
+)
+from examples.ahc015.python.ppo import (
+    PpoRollout,
+    collect_ppo_rollout,
+    generalized_advantages,
+    ppo_update,
+)
 
 
 def test_tilts_compact_without_reordering() -> None:
@@ -106,69 +114,76 @@ def test_model_shape_parameter_count_and_zero_residual() -> None:
     assert torch.equal(outputs, torch.zeros(2))
 
 
-class ZeroModel(torch.nn.Module):
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return torch.zeros(len(inputs), device=inputs.device)
+def test_config_and_ppo_model_shapes() -> None:
+    config = load_config(Path(__file__).parents[2] / "examples" / "ahc015" / "config.toml")
+    assert config.training.max_hours == 10.0
+    assert config.training.batch_size == 256
+    assert config.ppo.gamma == 1.0
+
+    model = Ahc015PpoNet().eval()
+    features = torch.randn(2, ACTION_COUNT, FEATURE_CHANNELS, SIDE, SIDE)
+    potentials = torch.rand(2, ACTION_COUNT)
+    with torch.inference_mode():
+        logits, values = model(features, potentials, config.ppo.logit_scale)
+    assert logits.shape == (2, ACTION_COUNT)
+    assert values.shape == (2,)
+    assert torch.allclose(logits, config.ppo.logit_scale * potentials)
+    assert torch.equal(values, torch.zeros(2))
 
 
-def test_rollout_stores_all_actions_and_mc_only_on_selected_actions() -> None:
-    replay, result = collect_rollouts(
-        ZeroModel(),
+def test_generalized_advantages_terminal_and_shape() -> None:
+    rewards = np.asarray([[0.1, 0.2, 0.3]], dtype=np.float32)
+    values = np.zeros_like(rewards)
+    advantages, returns = generalized_advantages(rewards, values, gamma=1.0, gae_lambda=1.0)
+    assert np.allclose(advantages, [[0.6, 0.5, 0.3]])
+    assert np.array_equal(advantages, returns)
+
+
+def test_ppo_rollout_and_update_smoke() -> None:
+    torch.manual_seed(3)
+    model = Ahc015PpoNet()
+    rng = np.random.default_rng(4)
+    rollout, result, metrics = collect_ppo_rollout(
+        model,
         torch.device("cpu"),
         episodes=2,
-        rng=np.random.default_rng(7),
-        epsilon=0.0,
-        inference_batch_size=128,
+        rng=rng,
+        gamma=1.0,
+        gae_lambda=0.95,
+        logit_scale=12.0,
     )
-    assert replay.boards.shape == (2 * 99 * ACTION_COUNT, CELL_COUNT)
-    assert np.isfinite(replay.mc_targets).sum() == 2 * 99
+    assert len(rollout) == 2 * 99
+    assert rollout.features.shape == (2 * 99, ACTION_COUNT, FEATURE_CHANNELS, SIDE, SIDE)
+    assert np.all(np.isfinite(rollout.advantages))
     assert np.all((result.potentials >= 0) & (result.potentials <= 1))
+    assert metrics["rollout/mean_score"] > 0
 
-
-def test_terminal_bellman_target_does_not_bootstrap() -> None:
-    flavors = np.ones((1, CELL_COUNT), dtype=np.uint8)
-    board = np.ones((1, CELL_COUNT), dtype=np.uint8)
-    board[0, -1] = 0
-    batch = ReplayBatch(
-        boards=board,
-        actions=np.zeros(1, dtype=np.uint8),
-        placed=np.asarray([99], dtype=np.uint8),
-        flavors=flavors,
-        mc_targets=np.asarray([np.nan], dtype=np.float32),
+    update_rollout = PpoRollout(
+        features=rollout.features[:4],
+        candidate_potentials=rollout.candidate_potentials[:4],
+        actions=rollout.actions[:4],
+        old_log_probs=rollout.old_log_probs[:4],
+        old_values=rollout.old_values[:4],
+        advantages=rollout.advantages[:4],
+        returns=rollout.returns[:4],
     )
-    targets = bellman_residual_targets(
-        batch,
-        ZeroModel(),
-        ZeroModel(),
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    before = model.actor.output.weight.detach().clone()
+    update_metrics = ppo_update(
+        model,
+        optimizer,
+        update_rollout,
         torch.device("cpu"),
-        np.random.default_rng(8),
-        placement_samples=8,
-        enumerate_threshold=16,
-        inference_batch_size=128,
+        rng,
+        epochs=1,
+        batch_size=len(update_rollout),
+        clip_ratio=0.2,
+        value_clip=0.2,
+        value_coefficient=0.5,
+        entropy_coefficient=0.01,
+        gradient_clip_norm=1.0,
+        logit_scale=12.0,
+        target_kl=0.03,
     )
-    assert np.isclose(targets[0], 1.0 - 99**2 / 100**2)
-
-
-def test_replay_ring_and_default_config() -> None:
-    buffer = ReplayBuffer(capacity=3)
-    for placed in (1, 2, 3, 4):
-        buffer.add(
-            ReplayBatch(
-                boards=np.full((1, CELL_COUNT), placed, dtype=np.uint8),
-                actions=np.zeros(1, dtype=np.uint8),
-                placed=np.asarray([placed], dtype=np.uint8),
-                flavors=np.ones((1, CELL_COUNT), dtype=np.uint8),
-                mc_targets=np.asarray([np.nan], dtype=np.float32),
-            )
-        )
-    assert len(buffer) == 3
-    sampled = buffer.sample(8, np.random.default_rng(9), minimum_placed=3)
-    assert np.all(sampled.placed >= 3)
-
-    config = load_config(Path(__file__).parents[2] / "examples" / "ahc015" / "config.toml")
-    assert config.backup.placement_samples == 8
-    assert config.training.batch_size == 128
-    assert config.training.target_update_interval == 1000
-    assert config.training.iterations == 300
-    assert config.training.max_hours == 10.0
-    assert config.wandb.mode == "online"
+    assert update_metrics["training/updates_this_iteration"] == 1
+    assert not torch.equal(model.actor.output.weight, before)
