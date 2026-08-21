@@ -497,3 +497,69 @@
   独立評価で改善方向が一致した
 - 判断: learning rate `2.5e-4`を採用する。KLとclip率に破綻はなく、不要な4 epoch目を一部省いて
   データ収集速度も改善した。新float actorを採用候補とし、提出更新前にRust int8量子化後を評価する
+
+## ppo-20260821-131630
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260821-131630`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15018
+- wall-clock limit: 2.000 hours
+- W&B: online, run ID `n2xsclrn`
+- status: time limit reached
+- elapsed: 2.031 hours
+- updates: 21463
+- best paired gain: 381250.174
+- 継続元: `ppo-20260821-103346/best-training.pt`、iteration 364、固定平均734,299.949
+- 設定変更: rollout 128、batch 1,024、4 epoch、learning rate `2.5e-4`を維持し、entropy係数だけを
+  `0.01`から`0.02`へ変更した
+- 完走確認: iteration 365から417まで53 iteration、2,626 optimizer update、671,616 transition。
+  W&B online run IDは`n2xsclrn`で、checkpointとfloat/int8 exportも正常に生成された
+- 固定512ケースbest: iteration 409（経過1.735時間）、平均729,663.203、`Phi`貪欲比
+  +381,250.174。継続元bestより-4,636.746。10回の固定評価平均は720,882.241、標準偏差5,000
+- 更新指標: 学習entropy平均0.4021、rollout entropy平均0.4117で、前runの0.3434、0.3517から
+  上昇した。平均KL 0.02222、clip fraction 15.30%、explained variance 0.9685。53 iteration中
+  10回は3 epoch（39 update）で停止し、43回は4 epoch（52 update）を実行した
+- 独立評価: 2,000件、seed `20260830`（学習、best選択、過去の独立評価には未使用）
+- 今回best: 平均722,712.550。継続元bestは平均727,420.534。同一ケース平均では今回bestが
+  -4,707.984 ±2,526.370点、今回bestの勝率49.75%、同率0%だった
+- 判断: entropyは意図どおり増えたが、固定評価と独立評価がともに悪化したため`0.02`は不採用とし、
+  entropy係数を`0.01`へ戻す
+
+## ppo-20260821-170807
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260821-170807`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15019
+- wall-clock limit: 4.000 hours
+- W&B: online, run ID `k8phfpfc`
+- status: time limit reached
+- elapsed: 4.018 hours
+- updates: 23803
+- best paired gain: 387864.820
+- 継続元: `ppo-20260821-103346/best-training.pt`、iteration 364、固定平均734,299.949
+- 設定変更: actorとcriticのglobal average poolingを`2x2` adaptive average poolingと線形射影へ
+  拡張した。新headは旧global averageと完全に同じ出力で初期化し、既存parameterの重みとAdam momentsを
+  引き継いだ。actorは368,209から451,297 parameterへ増加した
+- 完走確認: iteration 365から479まで115 iteration、4,966 optimizer update、1,457,280 transition。
+  W&B online run IDは`k8phfpfc`で、checkpointと新形式のfloat/int8 exportも正常に生成された
+- 固定512ケースbest: iteration 374（経過0.320時間）、平均736,277.850、`Phi`貪欲比
+  +387,864.820。継続元bestより+1,977.900。23回の固定評価平均は727,052.287、標準偏差6,155。
+  2時間以降はbestを更新せず、最終iteration 479は733,107.428だった
+- 更新指標: 平均KL 0.02226、clip fraction 13.75%、entropy 0.3408、explained variance 0.9720で、
+  global average版とほぼ同じ。115 iteration中73回は3 epoch、40回は4 epoch、各1回は1、2 epochで
+  停止した。spatial headの初期射影からのweight差L2は0.874で、新しい自由度は実際に学習された
+- Rust smoke benchmark: 同一環境3回平均でglobal average版0.569秒、spatial版0.578秒（約1.5%増）。
+  畳み込み本体は同じなので、追加headの実行時間への影響は小さい
+- 独立評価: 2,000件、seed `20260831`（学習、best選択、過去の独立評価には未使用）
+- 継続元best: 平均727,727.150。spatial bestは平均733,510.779、同一ケース差
+  +5,783.629 ±2,521.699、勝率53.15%、同率0.25%。終了モデルは平均731,322.264、同一ケース差
+  +3,595.114 ±2,543.505だった
+- 判断: 棄却。独立評価は改善方向だったが、bestが開始0.32時間時点で、その後4時間まで更新されず、
+  空間表現を利用した学習が成功した挙動には見えない。また、学習seed `15019`でglobal average版を
+  継続する対照runがないため、+5,784点をspatial headの効果と継続学習の軌跡差に分離できない。
+  採用モデルは`ppo-20260821-103346/best.pt`のglobal average版に戻す。再検証する場合は同一checkpoint・
+  seed・学習時間の対照runを用意する
