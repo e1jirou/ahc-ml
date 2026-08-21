@@ -6,7 +6,7 @@
 持たず、4個のafterstateを共有ネットワークで個別に採点する。これにより盤面回転・反転と味番号の
 対称性を特徴生成側で処理でき、学習後のactorを小さいRust推論器へそのまま移せる。
 
-10時間学習したPPO bestは、学習やcheckpoint選択に未使用の2,000ケースで平均698,013点だった。
+最初に10時間学習したPPO bestは、学習やcheckpoint選択に未使用の2,000ケースで平均698,013点だった。
 従来のBellman型afterstate学習は同じケースで607,950点であり、PPOが平均90,063点上回ったため、
 主方式をPPOへ変更する。過去の方式と棄却した実験は `experiments.md` に記録として残す。
 
@@ -99,11 +99,11 @@ L = L_policy + value_coefficient * L_value - entropy_coefficient * entropy
 
 | 項目 | 値 |
 | --- | ---: |
-| rollout episodes / iteration | 32 |
-| transitions / iteration | 3,168 |
+| rollout episodes / iteration | 128 |
+| transitions / iteration | 12,672 |
 | PPO epochs | 4 |
-| minibatch size | 256 |
-| AdamW learning rate | `1e-4` |
+| minibatch size | 1,024 |
+| AdamW learning rate | `2e-4`（基本学習）、`2.5e-4`（fine-tuning） |
 | weight decay | `1e-4` |
 | policy clip | `0.2` |
 | value clip | `0.2` |
@@ -177,39 +177,51 @@ Batch NormalizationとDropoutは使わず、学習時とRust推論時の差を�
 最後20回の固定評価は平均685,794、標準偏差7,766、範囲35,614だった。従来方式より安定したが、
 目標の平均80万には約10.2万点届かない。
 
-## 200 iteration以降の停滞
+その後、rollout 128局、batch 1,024、learning rate `2e-4`へ変更し、4時間runのbestからさらに
+10時間継続した。新bestは固定512ケースで725,449点、未使用の独立2,000ケースで723,675点となった。
+同じ独立ケース上で最初の10時間モデルは693,826点であり、新モデルが29,849 ±2,810点上回った。
 
-固定評価はiteration 49で621,150、99で661,221、199で665,252まで急速に伸びた。一方bestの
-704,182はiteration 789であり、その後約7時間で約3.9万点しか伸びていない。200以降の平均entropyは
-0.395、clip fractionは13.5%、KL early stop率は54.5%だった。方策が完全に決定的になったわけではないが、
-32 episodeだけで4 epoch更新するため、同じ小さなon-policy batchへ早く適合してKL制約に当たり、
-新しい状態分布を得る速度が律速になっている可能性が高い。
+さらに上記bestからlearning rateだけを`2.5e-4`へ上げて2時間継続した。固定512ケースbestは
+734,300点（+8,851）、別の未使用2,000ケースでは728,636点となり、同じケース上の継続元best
+722,045点を+6,590点上回った。56 iteration中24回はKL判定により3 epochで終了し、平均最適化時間も
+113.1秒から100.0秒へ短縮した。KL平均0.0222、clip fraction 13.8%で破綻は見られないため、
+初期状態からは`rollout 128 / batch 1,024 / learning rate 2e-4`で学習し、成熟したbestを`2.5e-4`で
+fine-tuningする2段階を標準手順とする。`2.5e-4`を初期状態から使う実験はしていない。最新float actorは
+提出モデルの更新候補だが、現在Rustへ埋め込まれているのは上表の初期PPOモデルなので、量子化後の
+独立評価が必要である。
 
-停滞原因を切り分けずに学習時間だけ延ばす優先度は低い。次の順で、各2時間程度のrunを固定seedと
-独立seedの両方で比較する。
+## 停滞対策の検証と現在の課題
 
-1. **rolloutを大きくする。** `rollout_episodes = 128`、minibatch `512`または`1024`とし、1 iterationの
-   状態多様性を4倍にする。まずPPO epochは4のままにし、sample再利用回数、KL、clip率を比較する。
-   wall-clock比較だけでなく、環境step数に対する改善も見る。最優先候補である。
-2. **更新圧を下げる。** 大きいrolloutでなおKL early stopが多ければ、epochを`4 -> 2`、または
-   learning rateを`1e-4 -> 5e-5`へ下げる。単独でLRだけを下げるより、rollout拡大後に調整する。
-3. **entropyをscheduleする。** 現在は係数`0.01`固定である。序盤`0.01`、iteration 200以降`0.02`〜`0.03`
-   の再加熱、または目標entropyに基づく自動調整を比較し、局所方策からの脱出を試す。
-4. **bestからfine-tuningする。** 新しいrunでは`best-training.pt`にactor、対応critic、optimizerを同時保存する。
-   これをresumeし、大batch・低更新圧で継続する。最初の10時間runにはこの完全checkpointがないため、
-   そのrunだけはbestからcriticを厳密には復元できない。
-5. **criticを改善する。** 現在は4候補値の単純平均である。候補特徴をpoolする専用state-value head、
-   value loss係数、GAE lambdaを比較する。explained varianceは終盤0.96前後なので優先度は上記より低い。
-6. **複数seed評価をbest選択に使う。** 固定512ケース1組だけでなく、複数seedを交互に評価し、単一集合への
+旧設定`rollout 32 / batch 256 / learning rate 1e-4`では、固定評価がiteration 49で621,150、99で
+661,221、199で665,252まで伸びた後、best 704,182へ到達するまで約7時間を要した。小さいon-policy
+batchでは状態分布の更新が遅いことを主因候補として、次の順に検証した。
+
+1. rolloutを128局、batchを1,024へ拡大すると、`lr=1e-4`では平均KLが0.0065まで下がり、同一時間・
+   同一transition数とも旧設定を下回った。大batch化だけでは更新圧が不足した。
+2. `lr=2e-4`へ上げると平均KLは0.0147となり、4時間時点で旧設定を約7,500点上回った。さらに10時間
+   継続して独立評価723,675点に到達し、rollout拡大とlearning rate調整の組合せを採用した。
+3. `lr=2.5e-4`で2時間継続すると独立評価がさらに6,590点改善した。56 iteration中24回は3 epochで
+   KL判定に達し、平均最適化時間も11.6%短縮した。平均KL 0.0222、clip fraction 13.8%であり、
+   target KL 0.03に対して適度な更新圧になっている。
+
+旧small-batch由来の停滞は改善されたため、今後は次の順で検証する。
+
+1. **entropyを再加熱する。** 現在は係数`0.01`固定で、最新runの学習entropyは平均0.343である。
+   最新bestから係数だけを`0.02`へ上げ、2時間で固定評価と独立評価を比較する。learning rateは同時に
+   変更せず、悪化時は`0.01`へ戻す。
+2. **複数seed評価をbest選択に使う。** 固定512ケース1組だけでなく、複数seedを交互に評価し、単一集合への
    過適合とcheckpoint偶然差を抑える。
-7. **大型teacherから提出モデルへ蒸留する。** 優先度は低いが、提出サイズや推論時間の制約を外した
+3. **現設定で長時間継続する。** `2.5e-4`は2時間で改善したが、bestは開始0.91時間時点だった。
+   entropy実験を先に切り分け、棄却した場合は現設定へ戻して長時間継続する。
+4. **criticを改善する。** 現在は4候補値の単純平均である。候補特徴をpoolする専用state-value head、
+   value loss係数、GAE lambdaを比較する。explained varianceは終盤0.96前後なので優先度は低い。
+5. **大型teacherから提出モデルへ蒸留する。** 優先度は低いが、提出サイズや推論時間の制約を外した
    大型PPOモデルまたはensembleが十分強くなれば、144 channelのactorへ蒸留する。同一局面の4候補に
    対するteacherのsoftな行動分布と候補間rankingを学習し、student自身の訪問状態にもteacherを適用する
    DAgger型を候補とする。teacherが現行studentを独立評価で明確に上回ることを実施条件とする。
 
-大batch化では、1 iterationが長くなって評価回数が減る点に注意する。W&Bにはscoreだけでなく、
-累積environment transitions、gradient update、KL early stop率、entropy、clip fraction、
-score/environment-stepを記録し、何が改善したかを判別できるようにする。
+W&Bにはscoreだけでなく、累積environment transitions、gradient update、KL early stop率、entropy、
+clip fraction、score/environment-stepを記録し、何が改善したかを判別できるようにする。
 
 ## 提出
 

@@ -19,10 +19,16 @@ caffeinate -i env PYTHONPATH=python .venv/bin/python \
 ```
 
 `best.pt` はactor単体で評価・提出用、`best-training.pt` はbest時点の完全な学習状態、`last.pt` は
-終了時点の完全な学習状態である。bestから追加学習する場合は同じコマンドへ次を追加する。
+終了時点の完全な学習状態である。基本学習のbestを`2.5e-4`で2時間fine-tuningする場合は次を使う。
 
 ```bash
---resume outputs/ahc015/<run-name>/best-training.pt
+caffeinate -i env PYTHONPATH=python .venv/bin/python \
+  -m examples.ahc015.python.train \
+  --config examples/ahc015/config_finetune.toml \
+  --device mps \
+  --wandb-mode online \
+  --max-hours 2 \
+  --resume outputs/ahc015/<run-name>/best-training.pt
 ```
 
 ## 評価と提出モデル生成

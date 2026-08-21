@@ -358,3 +358,142 @@
   min 0.557秒、max 0.694秒
 - 提出ソース: 493,655 bytes、SHA-256
   `958e5ff76707efa90360f5c3a263da9e3bf8063fcbae713c0a8d4982fe34d233`
+
+## rollout 128・batch 1024 事前速度計測
+
+- 目的: PPO停滞対策の2時間比較前に、MPS上の速度とメモリ適合性を確認する
+- 新設定: rollout 128局（12,672 transition）、batch 1,024、4 epoch。1 iterationだけ実行
+- 新設定の初回実測: rollout 16.882秒、PPO更新110.875秒、合計127.758秒、52 optimizer update
+- 現行10時間run平均: rollout 4.380秒、PPO更新25.518秒、非評価iteration合計29.898秒
+- 現行runの初回33.125秒との比較では3.86倍、現行平均との比較では4.27倍遅い。新設定の実測には
+  MPS初回実行の影響があるため、定常時は約115〜128秒/iterationと見積もる。扱うtransitionも4倍で、
+  評価を除くthroughput低下は大きくても約106.0から99.2 transition/秒への6.4%である
+- 固定512件評価の追加時間は現行実測で平均66.2秒。5 iterationごとの評価を維持すると、2時間で
+  約51〜56 iteration、約64.6万〜71.0万transition、10〜11回の固定評価を見込む。現行runの最初の2時間は
+  166 iteration、52.6万transition、8,632 optimizer updateだった
+- 新設定の2時間ではoptimizer updateは約2,650〜2,900回と見込む。各batchは4倍大きいため全sampleを
+  4 epoch見る点は同じだが、Adamのparameter update回数は約69%減る。勾配分散低下と更新回数低下を
+  合わせた変更として評価する
+- メモリ不足は発生せず、batch 1,024で完走した
+
+## ppo-20260820-133549
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260820-133549`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15015
+- wall-clock limit: 2.000 hours
+- W&B: online, run ID `ch8u6hiu`
+- status: time limit reached
+- elapsed: 2.044 hours
+- updates: 2704
+- best paired gain: 310430.637
+- 完走確認: 52 iteration、2,704 optimizer update、658,944 transition。MPSとW&B onlineは正常
+- 固定512ケースbest: iteration 39（経過1.563時間、506,880 transition）、平均658,843.666、
+  `Phi`貪欲比+310,430.637 ±5,582.356（標準誤差）、勝率98.44%
+- 現行設定の最初の2時間best: iteration 114、平均667,430.334。新設定bestは8,586.668点低い
+- ほぼ同じtransition数での比較: 新設定50 iteration（633,600 transition）の平均655,553に対し、
+  現行設定200 iteration（633,600 transition）は665,252で、新設定が約9,699点低い。途中10点の
+  比較でも新設定が上回ったのは506,880 transition時点の1回だけだった
+- 更新指標: 新設定52 iterationの平均KL 0.00648、clip fraction 7.61%、KL early stop 0%。現行設定の
+  最初の166 iterationはそれぞれ0.01258、12.09%、0.60%。大batch化で更新は明確に穏やかになった
+- 速度: rollout平均17.623秒、PPO更新平均109.789秒、評価込みiteration平均140.091秒。事前見積もり内
+- 独立評価: 2,000件、seed `20260826`（学習、best選択、過去の独立評価には未使用）
+- 新2時間best: 平均644,988.626。現行10時間best: 平均698,858.613。同一ケース上の差は
+  -53,869.987 ±3,105.691、新モデルが上回った割合34.60%、同点0.45%
+- 判断: rollout 128・batch 1,024・learning rate `1e-4`は安定化した一方、2時間および同一transition数で
+  スコア改善がなく、このまま10時間へ延長しない。平均KLがtarget 0.03に対して低くearly stopも0%なので、
+  batch 1,024のまま再挑戦するならlearning rate `2e-4`を次の短時間比較候補とする
+
+## ppo-20260820-172434
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260820-172434`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15015
+- wall-clock limit: 4.000 hours
+- W&B: online, run ID `0mtfaxub`
+- status: time limit reached
+- elapsed: 4.039 hours
+- updates: 5304
+- best paired gain: 342745.279
+- 完走確認: 102 iteration、5,304 optimizer update、1,292,544 transition。MPSとW&B onlineは正常
+- 固定512ケースbest: iteration 94（経過3.749時間、1,203,840 transition）、平均691,158.309、
+  `Phi`貪欲比+342,745.279。最終固定評価はiteration 99の684,732.158
+- 2時間時点best: 673,193.746。現行小batch設定の最初の2時間best 667,430.334より+5,763.412、
+  大batch `1e-4`版best 658,843.666より+14,350.080
+- 4時間時点best: 現行小batch設定の683,673.547に対して+7,484.762
+- 同一transition数比較: 50 iteration（633,600 transition）以降の固定評価11点中10点で現行設定を
+  上回った。iteration 94相当では+33,141点、iteration 99相当では+18,608点
+- 更新指標: 全102 iterationの平均KL 0.01473、clip fraction 13.75%、KL early stop 0%。後半52 iterationは
+  KL 0.01612、entropy 0.4266で、target KL 0.03を超えずに更新圧を回復できた
+- 速度: rollout平均17.671秒、PPO更新平均111.040秒。評価込みiteration平均は約140秒
+- 独立評価: 2,000件、seed `20260827`（学習、best選択、過去の独立評価には未使用）
+- 今回4時間best: 平均680,058.510、`Phi`貪欲比+329,967.978、勝率98.80%
+- 現行10時間best: 平均697,582.639。同一ケース上の差は-17,524.129 ±3,057.898、今回モデルが
+  上回った割合45.40%、同点0.25%
+- 判断: 4時間モデル単体は現行10時間bestをまだ下回るため提出には採用しない。一方、wall-clockと
+  transitionの両方で現行設定の同時点を上回り、`1e-4`大batch版も明確に上回ったため、rollout 128・
+  batch 1,024・learning rate `2e-4`を次の長時間学習候補として採用する
+
+## ppo-20260821-001327
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260821-001327`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15016
+- wall-clock limit: 10.000 hours
+- W&B: online, run ID `sob80xus`
+- status: time limit reached
+- elapsed: 10.005 hours
+- updates: 17927
+- best paired gain: 377035.801
+- 継続元: `ppo-20260820-172434/best-training.pt`、iteration 94、固定平均691,158.309
+- 完走確認: iteration 95から344まで250 iterationを追加し、累積17,927 optimizer update、
+  4,371,840 transition。追加学習10.005時間、累積学習時間はbestまでを含め約13.75時間
+- 固定512ケースbest: iteration 339（追加学習9.804時間）、平均725,448.830、`Phi`貪欲比
+  +377,035.801。最終iteration 344も721,459.510で、旧best 704,181.885を上回った
+- 最後20回の固定評価: 平均716,536.652、標準偏差5,549、range 22,689、隣接評価間の平均絶対変動
+  6,307。最初10回平均689,349に対し最後10回平均718,446で、後半にも改善が続いた
+- 更新指標: 平均KL 0.01924、clip fraction 13.80%、entropy 0.3749、explained variance 0.9668。
+  KL early stop表示は全体46%、最後100 iterationで75%だが、249/250 iterationは4 epochすべての
+  52 updateを実行しており、ほぼ常に最終epoch終了時に閾値を超えただけである
+- 独立評価: 2,000件、seed `20260828`（学習、best選択、過去の独立評価には未使用）
+- 継続run best: 平均723,674.946、`Phi`貪欲比+378,128.788 ±2,584.676、勝率99.70%
+- 現行10時間best: 平均693,826.054。同一ケース上の差は+29,848.892 ±2,809.720、新モデルが
+  上回った割合59.65%、同点0.40%
+- 判断: 固定評価と独立評価の両方で現行モデルを明確に上回った。新float actorを採用候補とし、
+  Rust int8量子化後の独立性能と速度を確認してから提出埋め込みモデルを更新する
+
+## ppo-20260821-103346
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260821-103346`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15017
+- wall-clock limit: 2.000 hours
+- W&B: online, run ID `xwdnk9zw`
+- status: time limit reached
+- elapsed: 2.052 hours
+- updates: 20267
+- best paired gain: 385886.920
+- 継続元: `ppo-20260821-001327/best-training.pt`、iteration 339、固定平均725,448.830
+- 設定変更: rollout 128、batch 1,024、4 epochを維持し、learning rateのみ`2e-4`から
+  `2.5e-4`へ変更。再開後のoptimizerにもconfigのlearning rateを再適用した
+- 完走確認: iteration 340から395まで56 iteration、2,600 optimizer update、709,632 transition。
+  learning rateは全iterationで`2.5e-4`と記録された
+- 固定512ケースbest: iteration 364（経過0.914時間）、平均734,299.949、`Phi`貪欲比
+  +385,886.920。継続元bestより+8,851.119。11回の固定評価平均は726,672.381、標準偏差5,262
+- 更新指標: 平均KL 0.02217、clip fraction 13.77%、entropy 0.3434。56 iteration中24回は
+  3 epoch（39 update）で停止し、残り32回は4 epoch（52 update）を実行した。最適化時間は平均
+  100.0秒で、`2e-4`継続runの平均113.1秒から11.6%短縮。transition速度は約349,390件/時
+- 独立評価: 2,000件、seed `20260829`（学習、best選択、過去の独立評価には未使用）
+- 今回best: 平均728,635.858、`Phi`貪欲比+378,357.950、勝率99.75%
+- 継続元best: 平均722,045.497。同一ケース平均では今回bestが+6,590.362点上回り、固定評価と
+  独立評価で改善方向が一致した
+- 判断: learning rate `2.5e-4`を採用する。KLとclip率に破綻はなく、不要な4 epoch目を一部省いて
+  データ収集速度も改善した。新float actorを採用候補とし、提出更新前にRust int8量子化後を評価する

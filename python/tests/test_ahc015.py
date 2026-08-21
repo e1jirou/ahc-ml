@@ -115,10 +115,16 @@ def test_model_shape_parameter_count_and_zero_residual() -> None:
 
 
 def test_config_and_ppo_model_shapes() -> None:
-    config = load_config(Path(__file__).parents[2] / "examples" / "ahc015" / "config.toml")
+    config_directory = Path(__file__).parents[2] / "examples" / "ahc015"
+    config = load_config(config_directory / "config.toml")
     assert config.training.max_hours == 10.0
-    assert config.training.batch_size == 256
+    assert config.training.rollout_episodes == 128
+    assert config.training.batch_size == 1024
+    assert config.training.learning_rate == 2e-4
     assert config.ppo.gamma == 1.0
+    fine_tune_config = load_config(config_directory / "config_finetune.toml")
+    assert fine_tune_config.training.max_hours == 2.0
+    assert fine_tune_config.training.learning_rate == 2.5e-4
 
     model = Ahc015PpoNet().eval()
     features = torch.randn(2, ACTION_COUNT, FEATURE_CHANNELS, SIDE, SIDE)

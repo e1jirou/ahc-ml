@@ -192,6 +192,10 @@ def main() -> None:
         checkpoint = load_checkpoint(
             args.resume, model=model, optimizer=optimizer, map_location=device
         )
+        # Optimizer checkpoints also contain their old learning rate.  Keep the
+        # moments, but let the new run's config control the resumed learning rate.
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = config.training.learning_rate
         start_iteration = int(checkpoint["epoch"]) + 1
         checkpoint_metrics = checkpoint.get("metrics", {})
         update = int(checkpoint_metrics.get("training/update", 0))
@@ -258,6 +262,7 @@ def main() -> None:
         metrics.update(update_metrics)
         metrics["training/update"] = float(update)
         metrics["training/environment_transitions"] = float(environment_transitions)
+        metrics["training/learning_rate"] = config.training.learning_rate
         metrics["training/early_stop_count"] = float(early_stop_count)
         metrics["training/early_stop_rate"] = early_stop_count / (iteration + 1)
         metrics["timing/optimization_seconds"] = time.monotonic() - optimization_started
