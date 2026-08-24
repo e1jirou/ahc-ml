@@ -563,3 +563,246 @@
   継続する対照runがないため、+5,784点をspatial headの効果と継続学習の軌跡差に分離できない。
   採用モデルは`ppo-20260821-103346/best.pt`のglobal average版に戻す。再検証する場合は同一checkpoint・
   seed・学習時間の対照runを用意する
+
+## 2026-08-21 現行モデルの10時間継続（実験準備）
+
+- 目的: 現行global-averageモデルを追加学習し、性能改善が継続するか、飽和へ向かうかを確認する
+- 継続元: `outputs/ahc015/ppo-20260821-103346/best-training.pt`（iteration 364、固定平均734,299.949）
+- architectureとoptimizer momentsはそのまま維持する
+- 設定: rollout 128、batch 1,024、4 epoch、learning rate `2.5e-4`、entropy係数`0.01`
+- rollout seed: 未使用の`15020`、固定評価seed: `515015`、時間: 10時間
+- config: `examples/ahc015/config_continue.toml`
+- 判断: 後半の評価平均、best更新時刻、独立2,000ケースのpaired比較から、現行モデルの飽和状況を判定する
+- status: time limit reached
+- output: `outputs/ahc015/ppo-20260821-232137`
+- W&B: online、run ID `pq9878o4`
+- 完走確認: 10.032時間、iteration 365から645まで281 iteration、3,560,832 transitionを追加し、
+  累積8,186,112 transition、31,408 optimizer update。MPSとW&B onlineは正常
+- 固定512ケースbest: iteration 579（経過7.643時間）、平均745,844.586、継続元bestより
+  +11,544.637。best更新は経過0.17、1.40、1.59、2.66、4.08、4.79、7.64時間に発生した
+- 最後10回の固定評価は平均733,351、最後20回は標準偏差5,334、range 20,813。7.64時間以降は
+  bestを更新せず、最終固定評価は737,935だった
+- 更新指標: 平均KL 0.02159、clip fraction 13.24%、学習entropy 0.3339、rollout entropy 0.3423、
+  explained variance 0.9740。281 iteration中157回は3 epoch、124回は4 epochを実行した
+- 独立評価: 2,000件、seed `20260901`（学習、best選択、過去の独立評価には未使用）
+- 継続元best: 平均729,784.088。今回best: 平均745,456.504。同一ケース差は
+  +15,672.416 ±2,509.918、今回bestの勝率55.60%、同率0.25%
+- 判断: 固定評価と独立評価の両方で明確に改善したため、新bestをglobal-average float actorとして採用する。
+  7時間台までbest更新が続いたため開始時点では飽和していなかった。一方、時間帯別平均は4時間以降
+  730,171〜735,600点の範囲で、最後2.4時間はbest更新がないため、終盤は飽和へ近づいた兆候がある。
+  完全な飽和とは断定せず、次の構造変更に対する10時間継続baselineとしてこのrunを用いる
+
+## 2026-08-22 rollout 512 / 1024 MPS速度計測
+
+- 目的: 公開されたAHC015 PPO事例の`batch_size=4096`はPPO minibatchではなく並列episode数なので、
+  現行実装の`rollout_episodes`を増やした場合のメモリ適合性と速度を確認する
+- checkpoint: `outputs/ahc015/ppo-20260821-232137/best-training.pt`（iteration 579）
+- 共通設定: minibatch 1,024、2 epochs、learning rate `2.5e-4`、MPS、各1 iteration。
+  固定評価は速度測定から除外した
+- rollout 512: 50,688 transition、288.387秒。rollout 67.088秒、最適化221.298秒、100 updates、
+  KL 0.02207、clip fraction 14.03%。OOMなし
+- rollout 1024: 101,376 transition、565.739秒。rollout 135.088秒、最適化430.650秒、198 updates、
+  KL 0.02447、clip fraction 15.13%。OOMなし
+- unique transition throughputは現行128局・実効3〜4 epochsの110.1件/秒に対し、512局で175.8件/秒、
+  1024局で179.2件/秒。固定512局評価の実測約69.2秒を5 iterationごとに含めると、10時間で
+  512局版は約604万、1024局版は約630万transitionを見込む。現行10時間runの356万件から約77%増える
+- optimizer update見込みは10時間で現行約12,600回、1024局・2 epochsも約12,300回でほぼ同じ。
+  gradient step数を大きく減らさず、1回のon-policy rolloutに含む初期盤面を8倍へ増やせる
+- 判断: 1024局はメモリ・更新指標・throughputの全てに問題がなく、512局よりわずかに効率がよい。
+  記事の4096局を直接使う前段階として、次の長時間実験には`rollout 1024 / minibatch 1024 / 2 epochs`を
+  第一候補とする
+
+## 2026-08-22 rollout 1024・8時間実験
+
+- 継続元: `outputs/ahc015/ppo-20260821-232137/best-training.pt`（iteration 579、固定平均745,844.586）
+- 変更: rollout episodeを128から1,024へ増やし、PPO epochsを4から2へ減らす。minibatch 1,024、
+  learning rate `2.5e-4`、entropy係数`0.01`、global-average architectureは維持する
+- rollout seed: 未使用の`15021`、固定評価seed: `515015`
+- 時間: 8時間。1 iteration実測と評価時間から約49 iteration、約497万transition、固定評価約10回を見込む
+- config: `examples/ahc015/config_rollout1024.toml`
+- 判断: 固定評価のbestと後半平均に加え、終了後に未使用2,000ケースで継続元とpaired比較する
+- status: time limit reached
+- output: `outputs/ahc015/ppo-20260822-125821`
+- W&B: online、run ID `hne9hqzn`
+
+## ppo-20260821-232137
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260821-232137`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15020
+- wall-clock limit: 10.000 hours
+- W&B: online, run ID `pq9878o4`
+- status: time limit reached
+- elapsed: 10.032 hours
+- updates: 31408
+- best paired gain: 397431.557
+
+## ppo-20260822-125821
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260822-125821`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15021
+- wall-clock limit: 8.000 hours
+- W&B: online, run ID `hne9hqzn`
+- status: time limit reached
+- elapsed: 8.115 hours
+- updates: 38318
+- best paired gain: 425085.432
+- 完走確認: 8.115時間、iteration 580から629まで50 iteration、5,068,800 transitionを追加し、
+  累積12,418,560 transition、38,318 optimizer update。MPSとW&B onlineは正常
+- 固定512ケースbest: iteration 604（経過4.054時間）、平均773,498.461、継続元bestより
+  +27,653.875。最終評価も772,727.082だった
+- 固定評価10回の前半5回平均は762,400.782、後半5回平均は769,057.463。後半平均が+6,657点高く、
+  開始直後だけの上振れではない。全10回の標準偏差は6,109、rangeは17,903
+- 更新指標: 平均KL 0.01157、clip fraction 10.14%、学習entropy 0.2927、rollout entropy 0.2961、
+  explained variance 0.9817。全50 iterationが2 epochs、198 updateを完遂し、KL early stopは0回
+- 速度: rollout平均134.861秒、最適化平均436.215秒、評価込みiteration平均584.103秒。
+  事前計測565.739秒に固定評価の償却分を加えた見積もりと整合する
+- 独立評価: 2,000件、seed `20260902`（学習、best選択、過去の独立評価には未使用）
+- 継続元best: 平均739,779.871。今回best: 平均763,407.717。同一ケース差は
+  +23,627.846 ±2,364.637、今回bestの勝率58.40%、同率0.15%
+- 判断: 固定評価と独立評価が一致して明確に改善し、後半評価も高水準なので採用する。現行の標準設定を
+  `rollout 1024 / minibatch 1024 / 2 epochs / learning rate 2.5e-4`へ更新する候補とする。
+  平均KLはtarget 0.03に対して0.0116まで下がったため、次に最適化設定を試す場合はlearning rateを
+  `3e-4`へ上げる短時間比較が候補になる
+
+## 2026-08-22 rollout 1024・learning rate 3e-4・10時間実験
+
+- 継続元: `outputs/ahc015/ppo-20260822-125821/best-training.pt`（iteration 604、固定平均773,498.461）
+- 変更: rollout 1,024、minibatch 1,024、2 epochs、entropy係数`0.01`を維持し、learning rateだけを
+  `2.5e-4`から`3e-4`へ上げる
+- 根拠: 採用runの平均KLは0.01157、clip fractionは10.14%、KL early stopは0回で、target KL
+  `0.03`に対して更新圧を上げる余地がある。rollout増加に対する単純なLR線形拡大ではなく、epochsを
+  4から2へ減らしたことで低下した更新圧を調整する実験と位置付ける
+- rollout seed: 未使用の`15022`、固定評価seed: `515015`
+- 時間: 10時間。直近の実測から約60 iteration、固定評価約12回を見込む
+- config: `examples/ahc015/config_rollout1024_lr3e4.toml`
+- 判断基準: 固定評価bestと後半推移を確認し、終了後に未使用2,000ケースで`2.5e-4`版bestとpaired比較する
+- status: time limit reached
+- output: `outputs/ahc015/ppo-20260822-234223`
+- W&B: online、run ID `r2s940ka`
+
+## ppo-20260822-234223
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260822-234223`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15022
+- wall-clock limit: 10.000 hours
+- W&B: online, run ID `r2s940ka`
+- status: time limit reached
+- elapsed: 10.047 hours
+- updates: 45644
+- best paired gain: 434793.912
+- 完走確認: 10.047時間、iteration 605から666まで62 iteration、6,285,312 transitionを追加し、
+  累積16,169,472 transition、45,644 optimizer update。MPSとW&B onlineは正常
+- 固定512ケースbest: iteration 664（経過9.710時間）、平均783,206.941、継続元bestより
+  +9,708.480。12回の固定評価の前半5回平均は770,981.571、後半5回平均は776,034.951で、
+  後半が+5,053.380点高い。全12回の標準偏差は4,257、rangeは17,048
+- 更新指標: 平均KL 0.01137、clip fraction 9.77%、学習entropy 0.2777、rollout entropy 0.2813、
+  explained variance 0.9835。全62 iterationが2 epochs、198 updateを完遂し、このrun中の
+  KL early stopは0回。learning rateを上げてもKLは継続元runの0.01157から増えなかった
+- 速度: rollout平均134.925秒、最適化平均434.630秒、評価込みiteration平均582.199秒
+- 独立評価: 2,000件、seed `20260903`（学習、best選択、過去の独立評価には未使用）
+- 継続元best: 平均764,589.828。今回best: 平均780,098.436。同一ケース差は
+  +15,508.608 ±2,198.476、今回bestの勝率56.20%、同率0.45%
+- 判断: 固定評価と独立評価が一致して明確に改善し、bestが最後の固定評価で更新されたため採用する。
+  一方、同じ開始checkpointから`2.5e-4`で継続した対照runはなく、平均KLも増えていないため、改善を
+  learning rate変更だけの効果とは断定しない。現時点では`3e-4`を維持し、さらに上げるより飽和を
+  確認する継続学習を優先する
+
+## 2026-08-23 最新モデルのRust量子化・提出ファイル生成
+
+- float checkpoint: `outputs/ahc015/ppo-20260822-234223/best.pt`
+- 未使用2,000ケース、seed `20260904`: float平均779,901.665、Rust int8平均781,754.434
+- Rust int8とfloatの同一ケース差は+1,852.770 ±1,049.693、公式スコア完全一致率72.30%。
+  量子化による有意な劣化は見られない
+- Rust unit testは7件成功、release buildと提出用単一ファイルのCargo compileも成功
+- ローカル実行時間: package binary 10回平均0.565秒、提出用単一ファイル5回平均0.564秒
+- 提出ファイル: `dist/ahc015.rs`、493,919 bytes。524,288 byte制限に対して30,369 bytesの余裕
+- 判断: 最新int8モデルを提出用Rustへ採用する
+
+## 2026-08-23 rollout 1024・learning rate 3e-4・追加10時間
+
+- 継続元: `outputs/ahc015/ppo-20260822-234223/best-training.pt`（iteration 664、固定平均783,206.941）
+- 設定: rollout 1,024、minibatch 1,024、2 epochs、learning rate `3e-4`、entropy係数`0.01`を維持する
+- rollout seed: 未使用の`15023`、固定評価seed: `515015`
+- 時間: 10時間。直近の実測から約60 iteration、固定評価約12回を見込む
+- config: `examples/ahc015/config_rollout1024_continue_lr3e4.toml`
+- 判断基準: 固定評価bestと後半推移を確認し、終了後に未使用2,000ケースで継続元とpaired比較する
+- status: time limit reached
+- output: `outputs/ahc015/ppo-20260823-225410`
+- W&B: online、run ID `pa9fgmc5`
+
+## ppo-20260823-225410
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260823-225410`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15023
+- wall-clock limit: 10.000 hours
+- W&B: online, run ID `pa9fgmc5`
+- status: time limit reached
+- elapsed: 10.064 hours
+- updates: 57524
+- best paired gain: 440518.488
+- 完走確認: 10.064時間、iteration 665から726まで62 iteration、6,285,312 transitionを追加し、
+  累積22,252,032 transition、57,524 optimizer update。MPSとW&B onlineは正常
+- 固定512ケースbest: 時間上限後の最終評価、iteration 726（経過10.043時間）、平均788,931.518、
+  継続元bestより+5,724.576。最終評価を含む13回の前半5回平均は779,043.450、後半5回平均は
+  786,090.148で、後半が+7,046.698点高い。標準偏差は4,252、rangeは12,950
+- 更新指標: 平均KL 0.01037、clip fraction 9.00%、学習entropy 0.2693、rollout entropy 0.2727、
+  explained variance 0.9844。全62 iterationが2 epochs、198 updateを完遂し、このrun中の
+  KL early stopは0回
+- 速度: rollout平均135.877秒、最適化平均434.550秒、評価込みiteration平均583.141秒
+- 独立評価: 2,000件、seed `20260905`（学習、best選択、過去の独立評価には未使用）
+- 継続元best: 平均780,156.972。今回best: 平均787,368.504。同一ケース差は
+  +7,211.532 ±2,196.178、今回bestの勝率52.80%、同率0.30%
+- 判断: 固定評価と独立評価が一致して改善したため採用する。bestが時間上限後の最終評価で更新されており、
+  完全な飽和には達していない。一方、独立評価の改善幅は前回10時間の+15,509点から+7,212点へ縮小し、
+  KLとentropyも低下しているため、限界効用は小さくなっている
+
+## 2026-08-24 rollout 1024・learning rate 3e-4・2回目の追加10時間（準備）
+
+- 継続元: `outputs/ahc015/ppo-20260823-225410/best-training.pt`（iteration 726、固定平均788,931.518）
+- 設定: rollout 1,024、minibatch 1,024、2 epochs、learning rate `3e-4`、entropy係数`0.01`を維持する
+- rollout seed: 未使用の`15024`、固定評価seed: `515015`
+- 時間: 10時間
+- config: `examples/ahc015/config_rollout1024_continue2_lr3e4.toml`
+- 判断基準: 独立評価の改善が3,000点未満、または後半の固定評価が横ばいなら、現行構成は概ね飽和と判断する
+- status: 実験準備完了
+
+## ppo-20260824-095458
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260824-095458`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15024
+- wall-clock limit: 10.000 hours
+- W&B: online, run ID `japvvnnk`
+- status: time limit reached
+- elapsed: 10.038 hours
+- updates: 69800
+- best paired gain: 447279.818
+- 完走確認: 10.038時間、iteration 727から788まで62 iteration、6,285,312 transitionを追加し、
+  累積28,537,344 transition、69,800 optimizer update。MPSとW&B onlineは正常
+- 固定512ケースbest: iteration 759、平均795,692.848、継続元bestより+6,761.330。12回の固定評価の
+  前半5回平均は788,180.826、後半5回平均は785,463.523で、後半が-2,717.303点低い。標準偏差は
+  3,625、rangeは14,486。best後の5回の固定評価では更新されなかった
+- 更新指標: 平均KL 0.01038、clip fraction 8.91%、学習entropy 0.2597、rollout entropy 0.2627、
+  explained variance 0.9857。全62 iterationが2 epochs、198 updateを完遂し、このrun中の
+  KL early stopは0回
+- 速度: rollout平均135.236秒、最適化平均433.720秒、評価込みiteration平均581.611秒
+- 独立評価: 2,000件、seed `20260906`（学習、best選択、過去の独立評価には未使用）
+- 継続元best: 平均786,174.941。今回best: 平均788,335.118。同一ケース差は
+  +2,160.178 ±2,045.527、今回bestの勝率51.40%、同率0.15%
+- 判断: 固定評価bestと独立評価はいずれも改善方向なのでcheckpointは採用する。ただし独立評価差は
+  標準誤差と同程度で、事前基準の3,000点未満である。固定評価の後半平均も前半を下回り、bestは
+  経過5.338時間のiteration 759から更新されなかったため、現行モデル・学習設定は概ね飽和したと判断する
