@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -41,12 +42,23 @@ def load_checkpoint(
     model: nn.Module,
     optimizer: Optimizer | None = None,
     map_location: str | torch.device = "cpu",
+    allowed_missing_keys: Collection[str] = (),
 ) -> dict[str, Any]:
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
     version = checkpoint.get("format_version")
     if version != CHECKPOINT_VERSION:
         raise ValueError(f"unsupported checkpoint version: {version}")
-    model.load_state_dict(checkpoint["model_state_dict"])
+    if allowed_missing_keys:
+        incompatible = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        unexpected_missing = set(incompatible.missing_keys) - set(allowed_missing_keys)
+        if unexpected_missing or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "incompatible checkpoint state: "
+                f"missing={sorted(unexpected_missing)}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
+    else:
+        model.load_state_dict(checkpoint["model_state_dict"])
     if optimizer is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint

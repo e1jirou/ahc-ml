@@ -806,3 +806,117 @@
 - 判断: 固定評価bestと独立評価はいずれも改善方向なのでcheckpointは採用する。ただし独立評価差は
   標準誤差と同程度で、事前基準の3,000点未満である。固定評価の後半平均も前半を下回り、bestは
   経過5.338時間のiteration 759から更新されなかったため、現行モデル・学習設定は概ね飽和したと判断する
+
+## 2026-08-24 未来列FiLM・10時間（準備）
+
+- 継続元: `outputs/ahc015/ppo-20260824-095458/best-training.pt`（iteration 759、固定平均795,692.848）
+- 変更: 既存の未来列144次元表現から共有の`gamma/beta`各144次元を直接生成する。
+  CNN stem直後へ`h' = (1 + gamma) * h + beta`として一度適用し、既存の最終fusionも維持する
+- 初期化: `gamma/beta`生成層をゼロ初期化し、継続開始時のactorとcriticを旧checkpointと一致させる。
+  既存parameterのAdamW momentも名前対応で引き継ぎ、新規FiLM parameterだけ状態なしから開始する。
+  継続元を新runの初期bestにも保存し、FiLM学習が悪化した場合に親checkpointを失わない
+- parameter: actor 368,209から409,969（+41,760、+11.34%）。FiLMの効果を分離して確認するため
+  低次元bottleneckは設けず、今回の実験では提出サイズを採否基準にしない
+- 設定: rollout 1,024、minibatch 1,024、2 epochs、learning rate `3e-4`、entropy係数`0.01`
+- rollout seed: 未使用の`15025`、固定評価seed: `515015`
+- 時間: 10時間
+- config: `examples/ahc015/config_film.toml`
+- 判断基準: 同設定の単純継続が独立評価+2,160点で概ね飽和したため、固定評価bestだけでなく、終了後の
+  未使用2,000ケースで継続元を明確に上回るかを重視する
+
+## ppo-20260824-230503
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260824-230503`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15025
+- wall-clock limit: 10.000 hours
+- W&B: online, run ID `jvqxedd3`
+- status: time limit reached
+- elapsed: 10.146 hours
+- updates: 76037
+- best paired gain: 449189.457
+- 完走確認: 10.146時間、iteration 760から820まで61 iteration、6,183,936 transitionを追加し、
+  累積31,781,376 transition、76,037 optimizer update。MPSとW&B onlineは正常
+- 固定512ケースbest: iteration 774（経過2.445時間）、平均797,602.486、継続元bestより+1,909.639。
+  12回の固定評価の前半5回平均は788,501.507、後半5回平均は793,949.114で、後半が
+  +5,447.607点高い。標準偏差は4,049、rangeは12,560。ただしbest後の9回では更新されなかった
+- 更新指標: 平均KL 0.01169、clip fraction 9.45%、学習entropy 0.2707、rollout entropy 0.2737、
+  explained variance 0.9853。60 iterationは2 epochs・198 updateを完遂し、KL early stopは初回の
+  1 iterationだけ。actorのFiLM weight normは初期0からbest時2.875、終了時6.296へ増加した
+- 速度: rollout平均139.795秒、最適化平均444.514秒、評価込みiteration平均597.495秒。
+  前runの581.611秒から約2.7%低下したが、10時間実験の運用上は問題ない
+- 独立評価: 2,000件、seed `20260908`（学習、best選択、過去の正式な独立評価には未使用）
+- 継続元best: 平均789,324.285。FiLM best: 平均791,701.636。同一ケース差は
+  +2,377.352 ±2,035.978、FiLM bestの勝率50.75%、同率0.30%
+- 提出サイズ: bestの量子化model dataだけで531,707 bytesとなり、Rustコードを加える前に524,288 byte
+  制限を超える。今回は効果判定を優先したため想定内
+- 判断: 固定評価と独立評価は改善方向だが、独立差は標準誤差と同程度であり、直前の単純継続の
+  +2,160 ±2,046点とほぼ同じである。FiLM固有の改善は確認できないものの、絶対スコアは上がっているため
+  `outputs/ahc015/ppo-20260824-230503/best.pt`を仮採用する。量子化model dataだけで提出サイズを超えるため、
+  現状のまま提出モデルにはできない
+
+## 2026-08-25 rollout 4096（準備）
+
+- 目的: 大型teacherモデルへ移る前に、1回のon-policy rolloutを1,024局から4,096局へ増やした効果を
+  現行FiLMモデルで確認する
+- 継続元: `outputs/ahc015/ppo-20260824-230503/best-training.pt`（FiLM仮採用best）
+- 問題: 旧実装は全候補の18x10x10特徴をfloat32で保持するため、4,096局では特徴bufferだけで
+  約10.88 GiBとなる。turnごとの配列を最後にstackする際は同程度の一時コピーも生じ、18 GB機では
+  OOMまたはswapが見込まれる。CNN推論も16,384候補の一括処理になり、MPS活性メモリが4倍になる
+- メモリ対策: 14番以外の特徴面はすべて1/100刻みなので、100倍したuint8で事前確保bufferへ直接保存する。
+  14番のpotential面は既存のfloat32 candidate potentialからminibatchごとに復元する。このためモデル入力の
+  意味を変えず、feature bufferを約2.72 GiBへ削減し、最後の巨大stackもなくす
+- MPS対策: rollout推論を`inference_batch_size=4096`候補、すなわち1,024局ずつに分割し、従来の
+  1,024局runと同じ推論時peak活性に抑える。PPO更新のminibatchも1,024のまま維持する
+- 更新回数対策: `2 epochs`のままでは約792 update/iterationとなり、古い方策のrolloutに対して更新しすぎる。
+  初回は`1 epoch`として約396 update/iterationに抑え、unique transitionの利用率を上げる
+- 事前速度見積もり: FiLM 1,024局runのrollout 139.8秒、2-epoch更新444.5秒から線形外挿すると、
+  4,096局・1 epochはrollout約559秒、更新約889秒、評価を除き約24.1分/iteration
+- 1分未満microbenchmark: 4,096局の中央turnを1回、PPO更新を4 minibatch、2.72 GiB bufferの全域書き込みを
+  seed `15026`と`15027`で測定した。各runの実時間は25.2秒と22.0秒。rollout外挿は514秒と551秒、
+  更新外挿は863秒と873秒、合計は1,378秒と1,425秒だった。平均約23.4分/iterationで事前見積もりと整合する。
+  buffer全域書き込みは0.151秒と0.113秒で、MPS modelと同時に2.72 GiBを保持してもOOMやswap兆候はなかった
+- evaluationを除く10時間見込み: 約25 iteration、約1,014万unique transition、約9,900
+  optimizer update。従来10時間runの約618万transition、
+  約12,000 updateに対し、データ多様性は増える一方でupdate数は約2割減る
+- evaluation: rollout 1,024時代と同等以上のbest選択粒度を保つため毎iteration実施する。実測約66秒を
+  用いると時間コストは約4.5%。10時間では学習約24 iteration、約973万unique transition、約9,500
+  optimizer update、evaluation約24回を見込む
+- config: `examples/ahc015/config_rollout4096.toml`（seed `15026`、10時間、evaluation interval 1）
+- benchmark: `examples/ahc015/python/benchmark_training.py`
+- status: 実装、test、1分未満の実機microbenchmarkまで完了。完全な1 iterationと学習は未実行
+
+## ppo-20260825-105935
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260825-105935`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15026
+- wall-clock limit: 10.000 hours
+- W&B: online, run ID `3o20qjh2`
+- status: time limit reached
+- elapsed: 10.022 hours
+- updates: 76433
+- best paired gain: 450311.150
+- 完走確認: 10.022時間、iteration 775から798まで24 iteration、9,732,096 transitionと9,504
+  optimizer updateを追加した。MPS、W&B online、2.72 GiBの圧縮rollout bufferは正常に動作した
+- 固定512ケース: 24回の平均792,977、標準偏差3,231、range 13,103。前半5回平均790,708に対し
+  後半5回平均793,342で+2,635点。bestは最後のiteration 798で798,724となり、継続元bestの
+  797,602を+1,122点上回った
+- 更新指標: 平均KL 0.00934、clip fraction 8.11%、学習entropy 0.2404、rollout entropy 0.2439、
+  explained variance 0.9868。全24 iterationが1 epoch・396 updateを完遂し、更新は安定していた
+- 速度: rollout平均548.573秒、最適化平均887.899秒、512局evaluation込みiteration平均1,502.864秒
+  （25.05分）。evaluationは平均約66.4秒、全体の4.42%。microbenchmarkの23.4分に対し実学習は
+  evaluationを除いて23.94分で、見積もり誤差は約2.5%だった
+- rollout収集効率: 1,024局FiLM runの725 transition/秒に対し739 transition/秒で約1.9%向上した。
+  evaluation込みのunique transition throughputは約170件/秒から270件/秒へ約59%向上した
+- 独立評価: 2,000件、seed `20260909`（学習、best選択、過去の独立評価には未使用）
+- 継続元best: 平均791,309.966。今回best: 平均797,557.963。同一ケース差は
+  +6,247.997 ±2,067.327、今回bestの勝率52.10%、同率0.15%。改善は約3.0標準誤差で明確
+- 提出サイズ: bestの量子化binaryは402,138 bytesだが、提出用base93 Rust model dataは532,310 bytesで
+  524,288 byte制限を超える。FiLMモデルは引き続きそのままでは提出できない
+- 判断: 独立評価で明確に改善し、固定評価bestも最終iterationで更新されたため、rollout 4,096・1 epochを
+  採用する。最新float actorを`outputs/ahc015/ppo-20260825-105935/best.pt`へ更新する

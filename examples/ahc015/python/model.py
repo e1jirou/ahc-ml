@@ -5,7 +5,13 @@ from torch import nn
 
 CHANNELS = 144
 RESIDUAL_BLOCKS = 9
-PARAMETER_COUNT = 368_209
+FILM_PARAMETER_NAMES = frozenset(
+    {
+        "film.weight",
+        "film.bias",
+    }
+)
+PARAMETER_COUNT = 409_969
 
 
 class ResidualDepthwiseBlock(nn.Module):
@@ -38,6 +44,7 @@ class Ahc015ValueNet(nn.Module):
         )
         self.future_fc1 = nn.Linear(3 * 10 * 10, CHANNELS)
         self.future_fc2 = nn.Linear(CHANNELS, CHANNELS)
+        self.film = nn.Linear(CHANNELS, CHANNELS * 2)
         self.fusion_fc = nn.Linear(CHANNELS * 2, CHANNELS * 2)
         self.output = nn.Linear(CHANNELS * 2, 1)
         self.reset_parameters()
@@ -51,16 +58,22 @@ class Ahc015ValueNet(nn.Module):
         # Exact phi-greedy behavior before the first update.
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
+        # Loading a pre-FiLM checkpoint starts from exactly the old policy.
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        board = torch.relu(self.board_stem(inputs[:, :15]))
-        for block in self.blocks:
-            board = block(board)
-        board = board.mean(dim=(2, 3))
-
         future = inputs[:, 15:].flatten(start_dim=1)
         future = torch.relu(self.future_fc1(future))
         future = torch.relu(self.future_fc2(future))
+
+        film = self.film(future)
+        gamma, beta = film.chunk(2, dim=1)
+        board = torch.relu(self.board_stem(inputs[:, :15]))
+        board = board * (1.0 + gamma[:, :, None, None]) + beta[:, :, None, None]
+        for block in self.blocks:
+            board = block(board)
+        board = board.mean(dim=(2, 3))
 
         fused = torch.cat((board, future), dim=1)
         fused = torch.relu(self.fusion_fc(fused))

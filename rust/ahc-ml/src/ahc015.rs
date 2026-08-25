@@ -34,6 +34,7 @@ pub struct Ahc015ValueNet {
     blocks: Vec<ResidualBlock>,
     future_fc1: Linear,
     future_fc2: Linear,
+    film: Option<Linear>,
     fusion_fc: Linear,
     output: Linear,
 }
@@ -93,7 +94,7 @@ fn take_linear(
 }
 
 impl Ahc015ValueNet {
-    pub const PARAMETER_COUNT: usize = 368_209;
+    pub const PARAMETER_COUNT: usize = 409_969;
     pub const INPUT_LENGTH: usize = FEATURE_CHANNELS * CELLS;
 
     pub fn from_tensors(mut tensors: HashMap<String, Tensor>) -> Result<Self, String> {
@@ -166,6 +167,11 @@ impl Ahc015ValueNet {
             SEQUENCE_CHANNELS * CELLS,
         )?;
         let future_fc2 = take_linear(&mut tensors, "future_fc2", CHANNELS, CHANNELS)?;
+        let film = if tensors.contains_key("film.weight") {
+            Some(take_linear(&mut tensors, "film", CHANNELS * 2, CHANNELS)?)
+        } else {
+            None
+        };
         let fusion_fc = take_linear(&mut tensors, "fusion_fc", FUSION_UNITS, CHANNELS * 2)?;
         let output = take_linear(&mut tensors, "output", 1, FUSION_UNITS)?;
 
@@ -181,6 +187,7 @@ impl Ahc015ValueNet {
             blocks,
             future_fc1,
             future_fc2,
+            film,
             fusion_fc,
             output,
         })
@@ -232,6 +239,35 @@ impl Ahc015ValueNet {
             .expect("validated stem shape");
         let mut activation = columns.dot(&stem_matrix.t());
         add_bias_relu(&mut activation, &self.stem_bias);
+
+        let mut future = Array2::<f32>::zeros((batch, SEQUENCE_CHANNELS * CELLS));
+        for sample in 0..batch {
+            let sample_base = sample * Self::INPUT_LENGTH;
+            for channel in 0..SEQUENCE_CHANNELS {
+                let source = sample_base + (SPATIAL_CHANNELS + channel) * CELLS;
+                let destination = channel * CELLS;
+                for cell in 0..CELLS {
+                    future[(sample, destination + cell)] = input[source + cell];
+                }
+            }
+        }
+        let future = linear_relu(future, &self.future_fc1);
+        let future = linear_relu(future, &self.future_fc2);
+        if let Some(film_layer) = &self.film {
+            let mut film = future.dot(&film_layer.weight.t());
+            add_bias(&mut film, &film_layer.bias);
+            for sample in 0..batch {
+                for cell in 0..CELLS {
+                    let row = sample * CELLS + cell;
+                    for channel in 0..CHANNELS {
+                        let gamma = film[(sample, channel)];
+                        let beta = film[(sample, CHANNELS + channel)];
+                        activation[(row, channel)] =
+                            activation[(row, channel)] * (1.0 + gamma) + beta;
+                    }
+                }
+            }
+        }
 
         for block in &self.blocks {
             let mut depthwise = Array2::<f32>::zeros((rows, CHANNELS));
@@ -288,20 +324,6 @@ impl Ahc015ValueNet {
         }
         board_embedding.mapv_inplace(|value| value / CELLS as f32);
 
-        let mut future = Array2::<f32>::zeros((batch, SEQUENCE_CHANNELS * CELLS));
-        for sample in 0..batch {
-            let sample_base = sample * Self::INPUT_LENGTH;
-            for channel in 0..SEQUENCE_CHANNELS {
-                let source = sample_base + (SPATIAL_CHANNELS + channel) * CELLS;
-                let destination = channel * CELLS;
-                for cell in 0..CELLS {
-                    future[(sample, destination + cell)] = input[source + cell];
-                }
-            }
-        }
-        let future = linear_relu(future, &self.future_fc1);
-        let future = linear_relu(future, &self.future_fc2);
-
         let mut fusion = Array2::<f32>::zeros((batch, CHANNELS * 2));
         for sample in 0..batch {
             for channel in 0..CHANNELS {
@@ -319,9 +341,14 @@ impl Ahc015ValueNet {
 }
 
 fn add_bias_relu(values: &mut Array2<f32>, bias: &Array1<f32>) {
+    add_bias(values, bias);
+    values.mapv_inplace(|value| value.max(0.0));
+}
+
+fn add_bias(values: &mut Array2<f32>, bias: &Array1<f32>) {
     for mut row in values.axis_iter_mut(Axis(0)) {
         for index in 0..bias.len() {
-            row[index] = (row[index] + bias[index]).max(0.0);
+            row[index] += bias[index];
         }
     }
 }
@@ -397,6 +424,8 @@ mod tests {
             + CHANNELS
             + CHANNELS * CHANNELS
             + CHANNELS
+            + CHANNELS * 2 * CHANNELS
+            + CHANNELS * 2
             + FUSION_UNITS * CHANNELS * 2
             + FUSION_UNITS
             + FUSION_UNITS

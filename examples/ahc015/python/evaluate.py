@@ -13,7 +13,7 @@ from ahc_ml.checkpoint import load_checkpoint
 from ahc_ml.device import select_device
 
 from .game import EpisodeState, official_score
-from .model import Ahc015ValueNet
+from .model import FILM_PARAMETER_NAMES, Ahc015ValueNet
 from .simulation import evaluate_policy, evaluate_random_policy, generate_cases
 
 ACTION_FROM_CHAR = {"F": 0, "B": 1, "L": 2, "R": 3}
@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="also evaluate the quantized model embedded in this Rust executable",
     )
+    parser.add_argument(
+        "--rust-model",
+        type=Path,
+        help="model.bin or model.q8.bin passed to the Rust executable with --model",
+    )
     parser.add_argument("--rust-workers", type=int, default=min(8, os.cpu_count() or 1))
     return parser.parse_args()
 
@@ -45,13 +50,17 @@ def summarize(name: str, scores: np.ndarray) -> dict[str, float | str]:
 
 def evaluate_rust_case(
     executable: Path,
+    model_path: Path | None,
     flavors: np.ndarray,
     ranks: np.ndarray,
 ) -> int:
     input_lines = [" ".join(map(str, flavors.tolist()))]
     input_lines.extend(map(str, ranks.tolist()))
+    command = [str(executable)]
+    if model_path is not None:
+        command.extend(("--model", str(model_path)))
     completed = subprocess.run(
-        [str(executable)],
+        command,
         input=("\n".join(input_lines) + "\n").encode(),
         capture_output=True,
         check=False,
@@ -71,6 +80,7 @@ def evaluate_rust_case(
 
 def evaluate_rust_policy(
     executable: Path,
+    model_path: Path | None,
     flavors: np.ndarray,
     ranks: np.ndarray,
     workers: int,
@@ -80,9 +90,13 @@ def evaluate_rust_policy(
     executable = executable.resolve()
     if not executable.is_file():
         raise FileNotFoundError(executable)
+    if model_path is not None:
+        model_path = model_path.resolve()
+        if not model_path.is_file():
+            raise FileNotFoundError(model_path)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         scores = executor.map(
-            lambda case: evaluate_rust_case(executable, *case),
+            lambda case: evaluate_rust_case(executable, model_path, *case),
             zip(flavors, ranks, strict=True),
         )
         return np.fromiter(scores, dtype=np.int64, count=len(flavors))
@@ -92,6 +106,8 @@ def main() -> None:
     args = parse_args()
     if args.episodes <= 0:
         raise ValueError("--episodes must be positive")
+    if args.rust_model is not None and args.rust_executable is None:
+        raise ValueError("--rust-model requires --rust-executable")
     device, _ = select_device(args.device)
     flavors, ranks = generate_cases(args.episodes, args.seed)
     random_result = evaluate_random_policy(flavors, ranks, seed=args.seed + 1)
@@ -108,7 +124,12 @@ def main() -> None:
     ]
     if args.checkpoint is not None:
         model = Ahc015ValueNet().to(device)
-        load_checkpoint(args.checkpoint, model=model, map_location=device)
+        load_checkpoint(
+            args.checkpoint,
+            model=model,
+            map_location=device,
+            allowed_missing_keys=FILM_PARAMETER_NAMES,
+        )
         learned = evaluate_policy(
             model,
             device,
@@ -131,7 +152,13 @@ def main() -> None:
     else:
         learned = None
     if args.rust_executable is not None:
-        rust_scores = evaluate_rust_policy(args.rust_executable, flavors, ranks, args.rust_workers)
+        rust_scores = evaluate_rust_policy(
+            args.rust_executable,
+            args.rust_model,
+            flavors,
+            ranks,
+            args.rust_workers,
+        )
         difference = rust_scores - greedy.scores
         report = summarize("rust-quantized", rust_scores)
         report.update(

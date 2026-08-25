@@ -87,9 +87,54 @@ caffeinate -i env PYTHONPATH=python .venv/bin/python \
 
 追加10時間後、この時点のfloat actorは`outputs/ahc015/ppo-20260823-225410/best.pt`となった。
 
-同じ設定でさらに10時間継続した最新float actorは`outputs/ahc015/ppo-20260824-095458/best.pt`である。
-独立評価の改善は小幅となり、現行構成は概ね飽和した。現在の提出用Rustは引き続き
+同じ設定でさらに10時間継続した提出可能構造の最新float actorは
+`outputs/ahc015/ppo-20260824-095458/best.pt`である。独立評価の改善は小幅となり、現行構成は概ね
+飽和した。現在の提出用Rustは引き続き
 `ppo-20260822-234223/best.pt`を埋め込んでいる。
+
+飽和したbestへ未来列によるFiLM conditioningを追加し、10時間継続する場合は次を使う。未来列の
+144次元表現から`gamma/beta`へ直接変換し、この実験では提出サイズより学習効果の判定を優先する。
+FiLM出力はゼロ初期化され、旧モデルの重みとoptimizer momentを移行するため、開始時の方策は継続元と
+一致する。
+
+```bash
+caffeinate -i env PYTHONPATH=python .venv/bin/python \
+  -m examples.ahc015.python.train \
+  --config examples/ahc015/config_film.toml \
+  --device mps \
+  --wandb-mode online \
+  --max-hours 10 \
+  --resume outputs/ahc015/ppo-20260824-095458/best-training.pt
+```
+
+FiLM仮採用bestから、rolloutを4,096局へ増やして10時間継続する場合は次を使う。メモリ削減のため
+rollout bufferを可逆なuint8表現で保持し、推論は1,024局ずつに分割する。1 iteration中の方策の陳腐化と
+所要時間を抑えるため、PPO epochは1とする。固定512局evaluationは毎iteration実施する。
+
+事前の1分未満microbenchmarkは次で実行できる。M3 Pro 18 GBで2回測定した結果は平均約23.4分/iteration
+だった。
+
+```bash
+env PYTHONPATH=python .venv/bin/python \
+  -m examples.ahc015.python.benchmark_training \
+  --device mps \
+  --checkpoint outputs/ahc015/ppo-20260824-230503/best-training.pt
+```
+
+```bash
+caffeinate -i env PYTHONPATH=python .venv/bin/python \
+  -m examples.ahc015.python.train \
+  --config examples/ahc015/config_rollout4096.toml \
+  --device mps \
+  --wandb-mode online \
+  --max-hours 10 \
+  --resume outputs/ahc015/ppo-20260824-230503/best-training.pt
+```
+
+rollout 4,096実験は24 iteration、約973万transitionを処理し、独立2,000局で継続元を
++6,248 ±2,067点上回ったため採用する。最新float actorは
+`outputs/ahc015/ppo-20260825-105935/best.pt`である。量子化binaryは402,138 bytesだが、base93化した
+Rust model dataは532,310 bytesでサイズ制限を超えるため、現状のまま提出モデルにはできない。
 
 ## 評価と提出モデル生成
 

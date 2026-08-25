@@ -99,9 +99,9 @@ L = L_policy + value_coefficient * L_value - entropy_coefficient * entropy
 
 | 項目 | 値 |
 | --- | ---: |
-| rollout episodes / iteration | 128（基本学習）、1,024（成熟モデルの継続） |
-| transitions / iteration | 12,672（基本学習）、101,376（成熟モデルの継続） |
-| PPO epochs | 4（基本学習）、2（成熟モデルの継続） |
+| rollout episodes / iteration | 128（基本学習）、4,096（採用済み継続設定） |
+| transitions / iteration | 12,672（基本学習）、405,504（採用済み継続設定） |
+| PPO epochs | 4（基本学習）、1（採用済み継続設定） |
 | minibatch size | 1,024 |
 | AdamW learning rate | `2e-4`（基本学習）、`2.5e-4`（fine-tuning）、`3e-4`（成熟モデルの継続） |
 | weight decay | `1e-4` |
@@ -140,8 +140,8 @@ L = L_policy + value_coefficient * L_value - entropy_coefficient * entropy
 
 ## ネットワーク
 
-actorとcriticはそれぞれ144 channel、9個のdepthwise-separable residual blockを持つ。actorは
-368,209 parameter、actorとcriticを合わせた学習モデルは736,418 parameterである。
+actorとcriticはそれぞれ144 channel、9個のdepthwise-separable residual blockを持つ。未来列による
+FiLMを含む実験モデルのactorは409,969 parameter、actorとcriticを合わせると819,938 parameterである。
 
 ```text
 board channels 0..14:
@@ -153,6 +153,11 @@ future channels 15..17:
     Flatten 300
     Linear 300 -> 144, ReLU
     Linear 144 -> 144, ReLU
+
+future conditioning:
+    Linear 144 -> 288
+    Split into gamma, beta (144 each)
+    Stem output h <- (1 + gamma) * h + beta
 
 fusion:
     Concatenate -> 288
@@ -221,6 +226,19 @@ on-policy rolloutで見る初期盤面を8倍に増やしたことが有効だ�
 標準誤差と同程度で、固定評価の後半5回平均も前半より2,717点低く、残り約5時間はbestを更新しなかった。
 このため、現行global-average構造を同じ設定で継続するだけの学習は概ね飽和したと判断する。
 
+このbestへ未来列からCNNを条件付けする直接FiLMを追加して10時間継続した。固定512ケースbestは
+797,602点、未使用の独立2,000ケースでは791,702点となり、同じケース上の継続元best 789,324点との差は
++2,377 ±2,036点だった。単純継続との差は明確でないが絶対スコアは改善方向なので、
+`outputs/ahc015/ppo-20260824-230503/best.pt`を最新float actorとして仮採用する。
+
+このFiLM bestから、rolloutを1,024局・2 epochsから4,096局・1 epochへ変更して10時間継続した。
+全特徴をfloat32で保持すると約10.88 GiBに加えて巨大な一時copyが必要になるため、1/100刻みの特徴面を
+uint8で保存し、potential面だけlosslessなfloat32配列からminibatch時に復元した。bufferは2.72 GiBとなり、
+rollout推論も1,024局ずつに分割した。24 iterationで約973万transitionを収集し、固定512ケースbestは
+最終iterationで798,724点となった。未使用の独立2,000ケースでは797,558点で、同じケース上の継続元
+791,310点を+6,248 ±2,067点上回った。改善が明確で後半も悪化していないため、rollout 4,096・1 epochを
+採用し、最新float actorを`outputs/ahc015/ppo-20260825-105935/best.pt`へ更新する。
+
 global average版bestから`2x2` spatial poolingへ拡張する4時間実験も行った。独立2,000ケースでは
 global average版を+5,784 ±2,522点上回ったが、bestは開始0.32時間時点で、その後4時間まで改善しなかった。
 また、別seedで継続したglobal average版の対照runがなく、改善をspatial headの効果と分離できない。
@@ -244,16 +262,14 @@ batchでは状態分布の更新が遅いことを主因候補として、次の
 2時間実験では、学習entropyは平均0.343から0.402へ上昇したが、固定評価bestは4,637点、独立2,000局は
 4,708点悪化した。このためentropy係数は`0.01`を維持し、今後は次の順で検証する。
 
-1. **モデル変更は同一条件の対照runで比較する。** 同設定での3回目の10時間継続は独立評価の改善が
-   +2,160 ±2,046点まで縮小し、固定評価も後半に伸びなかったため、現行構成は概ね飽和した。次は単純な
-   継続ではなくモデル構造または学習対象を変える。spatial poolingの再検証を行う場合は、同一checkpoint・
-   seed・学習時間のglobal average版も実行し、単なる継続学習の揺らぎと構造変更の効果を分離する。
-2. **criticを改善する。** 現在は4候補値の単純平均である。候補特徴をpoolする専用state-value head、
+1. **大型teacherをrollout 4,096で学習する。** 現行モデルでは独立評価が+6,248 ±2,067点改善し、
+   unique transition throughputもrollout 1,024版より約59%高くなった。次は提出制約を外してchannel数や
+   residual block数を数倍規模へ拡大し、現行モデルを明確に上回るteacherを作る。
+2. **大型teacherから提出モデルへ蒸留する。** teacherのsoftな4方向分布と候補間rankingを144 channel以下の
+   studentへ学習させ、student自身の訪問状態にもteacherを適用するDAgger型を候補とする。teacherが現行
+   studentを独立評価で明確に上回ることを蒸留開始条件とする。
+3. **criticを改善する。** 現在は4候補値の単純平均である。候補特徴をpoolする専用state-value head、
    value loss係数、GAE lambdaを比較する。explained varianceは最新runで0.98前後なので優先度は低い。
-3. **大型teacherから提出モデルへ蒸留する。** 優先度は低いが、提出サイズや推論時間の制約を外した
-   大型PPOモデルまたはensembleが十分強くなれば、144 channelのactorへ蒸留する。同一局面の4候補に
-   対するteacherのsoftな行動分布と候補間rankingを学習し、student自身の訪問状態にもteacherを適用する
-   DAgger型を候補とする。teacherが現行studentを独立評価で明確に上回ることを実施条件とする。
 
 W&Bにはscoreだけでなく、累積environment transitions、gradient update、KL early stop率、entropy、
 clip fraction、score/environment-stepを記録し、何が改善したかを判別できるようにする。
@@ -267,8 +283,9 @@ clip fraction、score/environment-stepを記録し、何が改善したかを判
 +1,853 ±1,050点、公式スコアの完全一致率は72.3%だった。量子化による有意な劣化はないため採用する。
 今後のper-output-channel量子化は、明確な量子化劣化が再び観測された場合のみ検討する。
 
-最新float actor `ppo-20260824-095458/best.pt`は現在の提出モデルより独立評価で改善しているため、
-次回の提出ファイル生成時に量子化して差し替える。
+採用した最新float actor `ppo-20260825-105935/best.pt`は、量子化binaryが402,138 bytesである一方、
+base93化したRust model dataは532,310 bytesとなり、それだけで提出サイズ制限を超える。提出モデルは
+まだ更新せず、大型teacherから提出可能なstudentへ蒸留した後に差し替える。
 
 144 channelモデルのAtCoder実測は約0.9秒、最新提出ファイルのローカル実測は平均0.564秒で、2秒制限には
 余裕がある。PPO単体で平均80万へ近づけることを優先し、その後に最後5手程度のexpectimaxや、

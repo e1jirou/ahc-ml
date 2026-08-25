@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from ahc_ml.checkpoint import load_checkpoint, save_checkpoint
+from ahc_ml.checkpoint import CHECKPOINT_VERSION, load_checkpoint, save_checkpoint
 from ahc_ml.device import select_device
 from ahc_ml.export import export_quantized_state_dict, export_state_dict
 from ahc_ml.seed import seed_everything
@@ -20,7 +20,7 @@ from ahc_ml.visualization import render_model_graph
 from .config import Ahc015Config, load_config
 from .features import FEATURE_CHANNELS
 from .game import SIDE
-from .model import PARAMETER_COUNT, Ahc015PpoNet, parameter_count
+from .model import FILM_PARAMETER_NAMES, PARAMETER_COUNT, Ahc015PpoNet, parameter_count
 from .ppo import collect_ppo_rollout, ppo_update
 from .simulation import evaluate_policy, generate_cases
 
@@ -78,7 +78,7 @@ def evaluate(
 
 def export_actor(model: torch.nn.Module, output_dir: Path) -> None:
     metadata = {
-        "architecture": "ahc015-ppo-actor-144x9-v1",
+        "architecture": "ahc015-ppo-actor-144x9-film-v2",
         "training_algorithm": "ppo",
         "channels": 144,
         "residual_blocks": 9,
@@ -91,6 +91,62 @@ def export_actor(model: torch.nn.Module, output_dir: Path) -> None:
         metadata=metadata,
         rust_source=output_dir / "model_data.rs",
     )
+
+
+def _restore_optimizer_state_by_name(
+    checkpoint: dict[str, object],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> None:
+    old_optimizer = checkpoint["optimizer_state_dict"]
+    old_model = checkpoint["model_state_dict"]
+    if not isinstance(old_optimizer, dict) or not isinstance(old_model, dict):
+        raise TypeError("invalid training checkpoint")
+    old_groups = old_optimizer["param_groups"]
+    current_optimizer = optimizer.state_dict()
+    current_groups = current_optimizer["param_groups"]
+    if len(old_groups) != 1 or len(current_groups) != 1:
+        raise ValueError("FiLM migration requires exactly one optimizer parameter group")
+
+    old_ids = old_groups[0]["params"]
+    old_names = list(old_model)
+    current_ids = current_groups[0]["params"]
+    current_names = [name for name, _ in model.named_parameters()]
+    if len(old_ids) != len(old_names) or len(current_ids) != len(current_names):
+        raise ValueError("checkpoint parameter order does not match optimizer state")
+    current_id_by_name = dict(zip(current_names, current_ids, strict=True))
+    old_state = old_optimizer["state"]
+    current_optimizer["state"] = {
+        current_id_by_name[name]: old_state[old_id]
+        for name, old_id in zip(old_names, old_ids, strict=True)
+        if name in current_id_by_name and old_id in old_state
+    }
+    optimizer.load_state_dict(current_optimizer)
+
+
+def load_training_checkpoint_with_film_migration(
+    path: Path,
+    model: Ahc015PpoNet,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> tuple[dict[str, object], bool]:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if checkpoint.get("format_version") != CHECKPOINT_VERSION:
+        raise ValueError(f"unsupported checkpoint version: {checkpoint.get('format_version')}")
+    incompatible = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    if incompatible.unexpected_keys:
+        raise RuntimeError(f"unexpected checkpoint tensors: {incompatible.unexpected_keys}")
+    expected_missing = {
+        f"{network}.{name}" for network in ("actor", "critic") for name in FILM_PARAMETER_NAMES
+    }
+    missing = set(incompatible.missing_keys)
+    if missing and missing != expected_missing:
+        raise RuntimeError(f"unexpected missing checkpoint tensors: {sorted(missing)}")
+    if missing:
+        _restore_optimizer_state_by_name(checkpoint, model, optimizer)
+    else:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return checkpoint, bool(missing)
 
 
 def apply_overrides(config: Ahc015Config, args: argparse.Namespace) -> Ahc015Config:
@@ -188,10 +244,13 @@ def main() -> None:
     environment_transitions = 0
     early_stop_count = 0
     start_iteration = 0
+    best_gain = -math.inf
     if args.resume is not None:
-        checkpoint = load_checkpoint(
-            args.resume, model=model, optimizer=optimizer, map_location=device
+        checkpoint, migrated_to_film = load_training_checkpoint_with_film_migration(
+            args.resume, model, optimizer, device
         )
+        if migrated_to_film:
+            print("initialized zero-impact FiLM layers and restored legacy optimizer moments")
         # Optimizer checkpoints also contain their old learning rate.  Keep the
         # moments, but let the new run's config control the resumed learning rate.
         for parameter_group in optimizer.param_groups:
@@ -201,8 +260,25 @@ def main() -> None:
         update = int(checkpoint_metrics.get("training/update", 0))
         environment_transitions = int(checkpoint_metrics.get("training/environment_transitions", 0))
         early_stop_count = int(checkpoint_metrics.get("training/early_stop_count", 0))
+        best_gain = float(checkpoint_metrics.get("evaluation/paired_gain", -math.inf))
+        if math.isfinite(best_gain):
+            save_checkpoint(
+                output_dir / "best.pt",
+                model=model.actor,
+                optimizer=optimizer,
+                epoch=start_iteration - 1,
+                config=config_dict,
+                metrics=checkpoint_metrics,
+            )
+            save_checkpoint(
+                output_dir / "best-training.pt",
+                model=model,
+                optimizer=optimizer,
+                epoch=start_iteration - 1,
+                config=config_dict,
+                metrics=checkpoint_metrics,
+            )
 
-    best_gain = -math.inf
     last_metrics: dict[str, float] = {"training/update": float(update)}
     last_iteration = start_iteration - 1
     training_started = time.monotonic()
@@ -233,6 +309,7 @@ def main() -> None:
             gamma=config.ppo.gamma,
             gae_lambda=config.ppo.gae_lambda,
             logit_scale=config.ppo.logit_scale,
+            inference_batch_size=config.training.inference_batch_size,
         )
         environment_transitions += len(rollout)
         metrics: dict[str, float] = {
