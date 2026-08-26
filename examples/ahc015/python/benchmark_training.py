@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
+import queue
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -111,6 +114,124 @@ def benchmark_rollout_turn(
     return time.perf_counter() - started, (board_storage, future_storage)
 
 
+def _parallel_rollout_worker(
+    worker: int,
+    checkpoint_path: str | None,
+    channels: int,
+    residual_blocks: int,
+    episodes: int,
+    inference_batch_size: int,
+    seed: int,
+    start_event: Any,
+    result_queue: Any,
+) -> None:
+    try:
+        # Each process owns one GPU and one CPU-side episode shard. Restricting
+        # PyTorch's CPU pool avoids oversubscribing Kaggle's relatively small
+        # CPU allocation; NumPy feature construction remains inside this shard.
+        torch.set_num_threads(1)
+        device = torch.device(f"cuda:{worker}")
+        torch.cuda.set_device(device)
+        rng = np.random.default_rng(seed)
+        model = Ahc015PpoNet(channels, residual_blocks).to(device)
+        if checkpoint_path is not None:
+            load_checkpoint(Path(checkpoint_path), model=model, map_location=device)
+
+        # Initialize CUDA/cuBLAS before the synchronized measurement.
+        with torch.inference_mode():
+            warmup_boards = torch.zeros(
+                (1, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE), device=device
+            )
+            warmup_futures = torch.zeros(
+                (1, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH), device=device
+            )
+            warmup_potentials = torch.zeros((1, ACTION_COUNT), device=device)
+            model(warmup_boards, warmup_futures, warmup_potentials, 12.0)
+        synchronize(device)
+        result_queue.put(("ready", worker, None))
+        if not start_event.wait(timeout=120):
+            raise TimeoutError("parallel rollout start timed out")
+
+        seconds, _ = benchmark_rollout_turn(
+            model,
+            device,
+            episodes,
+            inference_batch_size,
+            rng,
+        )
+        result_queue.put(("result", worker, seconds))
+    except BaseException as error:
+        result_queue.put(("error", worker, repr(error)))
+
+
+def benchmark_parallel_rollout_turn(
+    checkpoint: Path | None,
+    channels: int,
+    residual_blocks: int,
+    episodes: int,
+    inference_batch_size: int,
+    seed: int,
+    workers: int,
+) -> float:
+    if workers < 2:
+        raise ValueError("parallel rollout requires at least two workers")
+    if torch.cuda.device_count() < workers:
+        raise RuntimeError(f"parallel rollout requires {workers} CUDA devices")
+
+    shard_sizes = [episodes // workers] * workers
+    for worker in range(episodes % workers):
+        shard_sizes[worker] += 1
+    context = mp.get_context("spawn")
+    start_event = context.Event()
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_parallel_rollout_worker,
+            args=(
+                worker,
+                str(checkpoint) if checkpoint is not None else None,
+                channels,
+                residual_blocks,
+                shard_sizes[worker],
+                inference_batch_size,
+                seed + worker,
+                start_event,
+                result_queue,
+            ),
+        )
+        for worker in range(workers)
+    ]
+    for process in processes:
+        process.start()
+
+    try:
+        ready = set()
+        while len(ready) < workers:
+            kind, worker, payload = result_queue.get(timeout=180)
+            if kind == "error":
+                raise RuntimeError(f"rollout worker {worker} failed: {payload}")
+            if kind == "ready":
+                ready.add(worker)
+        start_event.set()
+        durations: dict[int, float] = {}
+        while len(durations) < workers:
+            kind, worker, payload = result_queue.get(timeout=300)
+            if kind == "error":
+                raise RuntimeError(f"rollout worker {worker} failed: {payload}")
+            if kind == "result":
+                durations[worker] = float(payload)
+    except queue.Empty as error:
+        raise TimeoutError("parallel rollout worker timed out") from error
+    finally:
+        start_event.set()
+        for process in processes:
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join()
+    return max(durations.values())
+
+
 def synthetic_rollout(transitions: int, rng: np.random.Generator) -> PpoRollout:
     board_features = rng.integers(
         0,
@@ -202,6 +323,13 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--micro-batch-size", type=int, default=128)
     parser.add_argument("--data-parallel", action="store_true")
+    parser.add_argument(
+        "--rollout-processes",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="independent CPU/GPU rollout pipelines (benchmark only)",
+    )
     parser.add_argument("--update-batches", type=int, default=4)
     parser.add_argument("--seed", type=int, default=15026)
     args = parser.parse_args()
@@ -224,13 +352,34 @@ def main() -> None:
             raise RuntimeError("data parallel benchmark requires at least two CUDA devices")
         execution_model = torch.nn.DataParallel(model)
 
-    rollout_turn_seconds, storage = benchmark_rollout_turn(
-        execution_model, device, args.episodes, args.inference_batch_size, rng
-    )
-    started = time.perf_counter()
-    for array in storage:
-        array.fill(0)
-    buffer_write_seconds = time.perf_counter() - started
+    if args.rollout_processes == 1:
+        rollout_turn_seconds, storage = benchmark_rollout_turn(
+            execution_model, device, args.episodes, args.inference_batch_size, rng
+        )
+        started = time.perf_counter()
+        for array in storage:
+            array.fill(0)
+        buffer_write_seconds = time.perf_counter() - started
+        buffer_bytes = sum(array.nbytes for array in storage)
+    else:
+        rollout_turn_seconds = benchmark_parallel_rollout_turn(
+            args.checkpoint,
+            channels,
+            residual_blocks,
+            args.episodes,
+            args.inference_batch_size,
+            args.seed,
+            args.rollout_processes,
+        )
+        # Both workers together retain the same number of episode features as
+        # the single-process collector; no large arrays cross process bounds.
+        buffer_bytes = (
+            (CELL_COUNT - 1)
+            * args.episodes
+            * ACTION_COUNT
+            * (BOARD_CHANNELS * SIDE * SIDE + FUTURE_CHANNELS * FUTURE_LENGTH)
+        )
+        buffer_write_seconds = math.nan
     update_seconds = benchmark_updates(
         execution_model,
         device,
@@ -249,11 +398,12 @@ def main() -> None:
         "episodes": args.episodes,
         "rollout_turn_seconds": rollout_turn_seconds,
         "estimated_rollout_seconds": estimated_rollout,
-        "buffer_gib": sum(array.nbytes for array in storage) / (1024**3),
+        "buffer_gib": buffer_bytes / (1024**3),
         "buffer_full_write_seconds": buffer_write_seconds,
         "measured_update_batches": args.update_batches,
         "micro_batch_size": args.micro_batch_size,
         "data_parallel": args.data_parallel,
+        "rollout_processes": args.rollout_processes,
         "update_seconds": update_seconds,
         "estimated_updates": update_count,
         "estimated_optimization_seconds": estimated_optimization,
