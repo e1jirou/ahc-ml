@@ -102,6 +102,7 @@ def evaluate(
 def release_cuda_cache() -> None:
     for index in range(torch.cuda.device_count()):
         with torch.cuda.device(index):
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
 
@@ -357,6 +358,7 @@ def main() -> None:
                 logit_scale=config.ppo.logit_scale,
                 inference_batch_size=config.training.inference_batch_size,
             )
+            release_cuda_cache()
         environment_transitions += len(rollout)
         metrics: dict[str, float] = {
             "iteration": float(iteration),

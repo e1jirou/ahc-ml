@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import math
 import multiprocessing as mp
 import traceback
@@ -121,7 +122,13 @@ def _worker_main(
         model = Ahc015PpoNet(channels, residual_blocks).to(device)
         rng = np.random.default_rng(seed)
         storage = shared_rollout.worker_storage(worker)
-        model.load_state_dict(payload["model_state_dict"])
+        model.load_state_dict(
+            torch.load(
+                io.BytesIO(payload["model_state_bytes"]),
+                map_location="cpu",
+                weights_only=True,
+            )
+        )
         if command == "collect":
             _, result, metrics = collect_ppo_rollout(
                 model,
@@ -229,8 +236,13 @@ class ParallelAhc015Runtime:
                 connection.close()
 
     @staticmethod
-    def _cpu_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-        return {name: value.detach().cpu() for name, value in model.state_dict().items()}
+    def _model_state_bytes(model: torch.nn.Module) -> bytes:
+        buffer = io.BytesIO()
+        torch.save(
+            {name: value.detach().cpu() for name, value in model.state_dict().items()},
+            buffer,
+        )
+        return buffer.getvalue()
 
     @staticmethod
     def _raise_worker_error(message: tuple[Any, ...]) -> None:
@@ -246,9 +258,9 @@ class ParallelAhc015Runtime:
         logit_scale: float,
         inference_batch_size: int,
     ) -> tuple[PpoRollout, EvaluationResult, dict[str, float]]:
-        state_dict = self._cpu_state_dict(model)
+        model_state_bytes = self._model_state_bytes(model)
         payload = {
-            "model_state_dict": state_dict,
+            "model_state_bytes": model_state_bytes,
             "gamma": gamma,
             "gae_lambda": gae_lambda,
             "logit_scale": logit_scale,
@@ -283,7 +295,7 @@ class ParallelAhc015Runtime:
     ) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
         if len(flavors) % self.workers:
             raise ValueError("evaluation episodes must be divisible by parallel workers")
-        state_dict = self._cpu_state_dict(model)
+        model_state_bytes = self._model_state_bytes(model)
         shard = len(flavors) // self.workers
         payloads = []
         for worker in range(self.workers):
@@ -291,7 +303,7 @@ class ParallelAhc015Runtime:
             stop = start + shard
             payloads.append(
                 {
-                    "model_state_dict": state_dict,
+                    "model_state_bytes": model_state_bytes,
                     "flavors": flavors[start:stop],
                     "ranks": ranks[start:stop],
                     "inference_batch_size": inference_batch_size,
