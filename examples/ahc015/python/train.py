@@ -28,6 +28,7 @@ from .simulation import evaluate_policy, generate_cases
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the AHC015 policy with PPO")
     parser.add_argument("--config", type=Path, default=Path("examples/ahc015/config.toml"))
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"))
     parser.add_argument("--iterations", type=int)
     parser.add_argument("--max-hours", type=float)
@@ -112,6 +113,7 @@ def load_training_checkpoint(
 def apply_overrides(config: Ahc015Config, args: argparse.Namespace) -> Ahc015Config:
     run = replace(
         config.run,
+        seed=args.seed if args.seed is not None else config.run.seed,
         device=args.device or config.run.device,
         experiment_log=(
             str(args.experiment_log) if args.experiment_log else config.run.experiment_log
