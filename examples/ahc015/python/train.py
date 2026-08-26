@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from ahc_ml.checkpoint import CHECKPOINT_VERSION, load_checkpoint, save_checkpoint
+from ahc_ml.checkpoint import load_checkpoint, save_checkpoint
 from ahc_ml.device import select_device
 from ahc_ml.export import export_quantized_state_dict, export_state_dict
 from ahc_ml.seed import seed_everything
@@ -18,9 +18,9 @@ from ahc_ml.tracking import WandbTracker
 from ahc_ml.visualization import render_model_graph
 
 from .config import Ahc015Config, load_config
-from .features import FEATURE_CHANNELS
+from .features import BOARD_CHANNELS, FUTURE_CHANNELS, FUTURE_LENGTH
 from .game import SIDE
-from .model import FILM_PARAMETER_NAMES, PARAMETER_COUNT, Ahc015PpoNet, parameter_count
+from .model import STUDENT_CHANNELS, STUDENT_RESIDUAL_BLOCKS, Ahc015PpoNet, parameter_count
 from .ppo import collect_ppo_rollout, ppo_update
 from .simulation import evaluate_policy, generate_cases
 
@@ -76,13 +76,20 @@ def evaluate(
     }
 
 
-def export_actor(model: torch.nn.Module, output_dir: Path) -> None:
+def export_actor(
+    model: torch.nn.Module,
+    output_dir: Path,
+    *,
+    channels: int,
+    residual_blocks: int,
+) -> None:
+    parameters = parameter_count(model)
     metadata = {
-        "architecture": "ahc015-ppo-actor-144x9-film-v2",
+        "architecture": f"ahc015-ppo-actor-{channels}x{residual_blocks}-film-v3",
         "training_algorithm": "ppo",
-        "channels": 144,
-        "residual_blocks": 9,
-        "parameter_count": PARAMETER_COUNT,
+        "channels": channels,
+        "residual_blocks": residual_blocks,
+        "parameter_count": parameters,
     }
     export_state_dict(model.state_dict(), output_dir / "model.bin", metadata=metadata)
     export_quantized_state_dict(
@@ -93,60 +100,13 @@ def export_actor(model: torch.nn.Module, output_dir: Path) -> None:
     )
 
 
-def _restore_optimizer_state_by_name(
-    checkpoint: dict[str, object],
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-) -> None:
-    old_optimizer = checkpoint["optimizer_state_dict"]
-    old_model = checkpoint["model_state_dict"]
-    if not isinstance(old_optimizer, dict) or not isinstance(old_model, dict):
-        raise TypeError("invalid training checkpoint")
-    old_groups = old_optimizer["param_groups"]
-    current_optimizer = optimizer.state_dict()
-    current_groups = current_optimizer["param_groups"]
-    if len(old_groups) != 1 or len(current_groups) != 1:
-        raise ValueError("FiLM migration requires exactly one optimizer parameter group")
-
-    old_ids = old_groups[0]["params"]
-    old_names = list(old_model)
-    current_ids = current_groups[0]["params"]
-    current_names = [name for name, _ in model.named_parameters()]
-    if len(old_ids) != len(old_names) or len(current_ids) != len(current_names):
-        raise ValueError("checkpoint parameter order does not match optimizer state")
-    current_id_by_name = dict(zip(current_names, current_ids, strict=True))
-    old_state = old_optimizer["state"]
-    current_optimizer["state"] = {
-        current_id_by_name[name]: old_state[old_id]
-        for name, old_id in zip(old_names, old_ids, strict=True)
-        if name in current_id_by_name and old_id in old_state
-    }
-    optimizer.load_state_dict(current_optimizer)
-
-
-def load_training_checkpoint_with_film_migration(
+def load_training_checkpoint(
     path: Path,
     model: Ahc015PpoNet,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-) -> tuple[dict[str, object], bool]:
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-    if checkpoint.get("format_version") != CHECKPOINT_VERSION:
-        raise ValueError(f"unsupported checkpoint version: {checkpoint.get('format_version')}")
-    incompatible = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-    if incompatible.unexpected_keys:
-        raise RuntimeError(f"unexpected checkpoint tensors: {incompatible.unexpected_keys}")
-    expected_missing = {
-        f"{network}.{name}" for network in ("actor", "critic") for name in FILM_PARAMETER_NAMES
-    }
-    missing = set(incompatible.missing_keys)
-    if missing and missing != expected_missing:
-        raise RuntimeError(f"unexpected missing checkpoint tensors: {sorted(missing)}")
-    if missing:
-        _restore_optimizer_state_by_name(checkpoint, model, optimizer)
-    else:
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return checkpoint, bool(missing)
+) -> dict[str, object]:
+    return load_checkpoint(path, model=model, optimizer=optimizer, map_location=device)
 
 
 def apply_overrides(config: Ahc015Config, args: argparse.Namespace) -> Ahc015Config:
@@ -220,12 +180,17 @@ def main() -> None:
     print(f"W&B mode: {config.wandb.mode}, run ID: {tracker.run_id}")
     print(f"wall-clock limit: {config.training.max_hours:.3f} hours")
 
-    model = Ahc015PpoNet()
-    if parameter_count(model.actor) != PARAMETER_COUNT:
-        raise RuntimeError("AHC015 actor parameter count changed unexpectedly")
+    model = Ahc015PpoNet(config.model.channels, config.model.residual_blocks)
+    print(
+        f"model: {config.model.channels} channels x "
+        f"{config.model.residual_blocks} blocks, {parameter_count(model.actor):,} actor parameters"
+    )
     graph_svg, graph_png = render_model_graph(
         model.actor,
-        input_size=(1, FEATURE_CHANNELS, SIDE, SIDE),
+        input_size=[
+            (1, BOARD_CHANNELS, SIDE, SIDE),
+            (1, FUTURE_CHANNELS, FUTURE_LENGTH),
+        ],
         output_stem=output_dir / "model-graph",
     )
     tracker.log_image(
@@ -246,11 +211,7 @@ def main() -> None:
     start_iteration = 0
     best_gain = -math.inf
     if args.resume is not None:
-        checkpoint, migrated_to_film = load_training_checkpoint_with_film_migration(
-            args.resume, model, optimizer, device
-        )
-        if migrated_to_film:
-            print("initialized zero-impact FiLM layers and restored legacy optimizer moments")
+        checkpoint = load_training_checkpoint(args.resume, model, optimizer, device)
         # Optimizer checkpoints also contain their old learning rate.  Keep the
         # moments, but let the new run's config control the resumed learning rate.
         for parameter_group in optimizer.param_groups:
@@ -433,7 +394,6 @@ def main() -> None:
         },
     )
     load_checkpoint(output_dir / "best.pt", model=model.actor, map_location=device)
-    export_actor(model.actor, output_dir)
     tracker.log_artifact(
         output_dir / "best.pt", name=f"{run_name}-actor-checkpoint", artifact_type="model"
     )
@@ -442,14 +402,24 @@ def main() -> None:
         name=f"{run_name}-training-checkpoint",
         artifact_type="model",
     )
-    tracker.log_artifact(
-        output_dir / "model.bin", name=f"{run_name}-rust-weights", artifact_type="model"
-    )
-    tracker.log_artifact(
-        output_dir / "model.q8.bin",
-        name=f"{run_name}-rust-weights-q8",
-        artifact_type="model",
-    )
+    if (
+        config.model.channels == STUDENT_CHANNELS
+        and config.model.residual_blocks == STUDENT_RESIDUAL_BLOCKS
+    ):
+        export_actor(
+            model.actor,
+            output_dir,
+            channels=config.model.channels,
+            residual_blocks=config.model.residual_blocks,
+        )
+        tracker.log_artifact(
+            output_dir / "model.bin", name=f"{run_name}-rust-weights", artifact_type="model"
+        )
+        tracker.log_artifact(
+            output_dir / "model.q8.bin",
+            name=f"{run_name}-rust-weights-q8",
+            artifact_type="model",
+        )
     tracker.finish()
     append_experiment_log(
         log_path,

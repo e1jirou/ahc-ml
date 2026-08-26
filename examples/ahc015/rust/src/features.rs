@@ -3,13 +3,13 @@ use crate::game::{
     potential,
 };
 
-pub const FEATURE_CHANNELS: usize = 18;
+pub const FEATURE_CHANNELS: usize = 15;
+const BOARD_CHANNELS: usize = 12;
 const COMPONENT_CHANNEL_START: usize = 4;
 const TURN_CHANNEL: usize = 7;
-const TOTAL_CHANNEL_START: usize = 8;
-const REMAINING_CHANNEL_START: usize = 11;
-const POTENTIAL_CHANNEL: usize = 14;
-const SEQUENCE_CHANNEL_START: usize = 15;
+const REMAINING_CHANNEL_START: usize = 8;
+const POTENTIAL_CHANNEL: usize = 11;
+const SEQUENCE_CHANNEL_START: usize = BOARD_CHANNELS;
 
 pub fn encode_candidates(boards: &[Board; ACTION_COUNT], placed: usize, input: &Input) -> Vec<f32> {
     let mut output = vec![0.0; ACTION_COUNT * FEATURE_CHANNELS * CANDY_COUNT];
@@ -49,19 +49,12 @@ fn encode_one(
         TURN_CHANNEL,
         placed as f32 / CANDY_COUNT as f32,
     );
-    let totals = input.totals();
     let mut remaining = [0; 3];
     for &flavor in &input.flavors()[placed..] {
         remaining[flavor as usize - 1] += 1;
     }
     for original in 0..3 {
         let canonical = mapping[original + 1] as usize - 1;
-        fill_plane(
-            output,
-            sample_base,
-            TOTAL_CHANNEL_START + canonical,
-            totals[original] as f32 / CANDY_COUNT as f32,
-        );
         fill_plane(
             output,
             sample_base,
@@ -76,10 +69,10 @@ fn encode_one(
         potential(&board, input.denominator()),
     );
 
-    for offset in 0..CANDY_COUNT - placed {
-        let original = input.flavors()[placed + offset] as usize;
+    for position in placed..CANDY_COUNT {
+        let original = input.flavors()[position] as usize;
         let canonical = mapping[original] as usize - 1;
-        output[sample_base + (SEQUENCE_CHANNEL_START + canonical) * CANDY_COUNT + offset] = 1.0;
+        output[sample_base + (SEQUENCE_CHANNEL_START + canonical) * CANDY_COUNT + position] = 1.0;
     }
 }
 

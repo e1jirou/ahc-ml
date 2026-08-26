@@ -11,7 +11,13 @@ import torch
 from ahc_ml.checkpoint import load_checkpoint
 from ahc_ml.device import select_device
 
-from .features import FEATURE_CHANNELS, encode_afterstates
+from .features import (
+    BOARD_CHANNELS,
+    FUTURE_CHANNELS,
+    FUTURE_LENGTH,
+    POTENTIAL_CHANNEL,
+    encode_afterstates,
+)
 from .game import (
     ACTION_COUNT,
     CELL_COUNT,
@@ -22,7 +28,12 @@ from .game import (
     potential,
     tilt,
 )
-from .model import Ahc015PpoNet
+from .model import (
+    TEACHER_CHANNELS,
+    TEACHER_RESIDUAL_BLOCKS,
+    Ahc015PpoNet,
+    dimensions_from_state_dict,
+)
 from .ppo import PpoRollout, ppo_update
 
 
@@ -53,12 +64,16 @@ def benchmark_rollout_turn(
     episodes: int,
     inference_batch_size: int,
     rng: np.random.Generator,
-) -> tuple[float, np.ndarray]:
+) -> tuple[float, tuple[np.ndarray, np.ndarray]]:
     turn = CELL_COUNT // 2
     boards, flavors, ranks = representative_boards(episodes, rng)
     score_denominators = np.asarray([denominator(row) for row in flavors])
-    storage = np.empty(
-        (CELL_COUNT - 1, episodes, ACTION_COUNT, FEATURE_CHANNELS, SIDE, SIDE),
+    board_storage = np.empty(
+        (CELL_COUNT - 1, episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE),
+        dtype=np.uint8,
+    )
+    future_storage = np.empty(
+        (CELL_COUNT - 1, episodes, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH),
         dtype=np.uint8,
     )
 
@@ -69,12 +84,16 @@ def benchmark_rollout_turn(
             boards[episode], int(ranks[episode]), int(flavors[episode, turn])
         )
     candidates = np.stack([afterstates(board) for board in boards])
-    features = encode_afterstates(
+    board_features, future_features = encode_afterstates(
         candidates.reshape(episodes * ACTION_COUNT, SIDE, SIDE),
         np.tile(np.arange(ACTION_COUNT, dtype=np.uint8), episodes),
         np.full(episodes * ACTION_COUNT, turn + 1, dtype=np.uint8),
         np.repeat(flavors, ACTION_COUNT, axis=0),
-    ).reshape(episodes, ACTION_COUNT, FEATURE_CHANNELS, SIDE, SIDE)
+    )
+    board_features = board_features.reshape(episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
+    future_features = future_features.reshape(
+        episodes, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH
+    )
     candidate_potentials = np.empty((episodes, ACTION_COUNT), dtype=np.float32)
     for episode in range(episodes):
         for action in range(ACTION_COUNT):
@@ -86,29 +105,38 @@ def benchmark_rollout_turn(
     with torch.inference_mode():
         for start in range(0, episodes, episode_batch_size):
             stop = min(start + episode_batch_size, episodes)
-            inputs = torch.from_numpy(features[start:stop]).to(device)
+            boards_input = torch.from_numpy(board_features[start:stop]).to(device)
+            futures_input = torch.from_numpy(future_features[start:stop]).to(device)
             potentials = torch.from_numpy(candidate_potentials[start:stop]).to(device)
-            logits, values = model(inputs, potentials, 12.0)
+            logits, values = model(boards_input, futures_input, potentials, 12.0)
             _ = logits.cpu().numpy(), values.cpu().numpy()
-    features *= CELL_COUNT
-    np.rint(features, out=features)
-    storage[0] = features
-    storage[0, :, :, 14] = 0
+    board_features *= CELL_COUNT
+    np.rint(board_features, out=board_features)
+    board_storage[0] = board_features
+    board_storage[0, :, :, POTENTIAL_CHANNEL] = 0
+    future_storage[0] = future_features
     synchronize(device)
-    return time.perf_counter() - started, storage
+    return time.perf_counter() - started, (board_storage, future_storage)
 
 
 def synthetic_rollout(transitions: int, rng: np.random.Generator) -> PpoRollout:
-    features = rng.integers(
+    board_features = rng.integers(
         0,
         CELL_COUNT + 1,
-        size=(transitions, ACTION_COUNT, FEATURE_CHANNELS, SIDE, SIDE),
+        size=(transitions, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE),
         dtype=np.uint8,
     )
-    features[:, :, 14] = 0
+    board_features[:, :, POTENTIAL_CHANNEL] = 0
+    future_features = rng.integers(
+        0,
+        2,
+        size=(transitions, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH),
+        dtype=np.uint8,
+    )
     potentials = rng.random((transitions, ACTION_COUNT), dtype=np.float32)
     return PpoRollout(
-        features=features,
+        board_features=board_features,
+        future_features=future_features,
         candidate_potentials=potentials,
         actions=rng.integers(ACTION_COUNT, size=transitions, dtype=np.int64),
         old_log_probs=np.zeros(transitions, dtype=np.float32),
@@ -171,7 +199,7 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("outputs/ahc015/ppo-20260824-230503/best-training.pt"),
+        help="optional training checkpoint; its model dimensions are detected automatically",
     )
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     parser.add_argument("--episodes", type=int, default=4096)
@@ -183,14 +211,23 @@ def main() -> None:
 
     device, device_info = select_device(args.device)
     rng = np.random.default_rng(args.seed)
-    model = Ahc015PpoNet().to(device)
-    load_checkpoint(args.checkpoint, model=model, map_location=device)
+    if args.checkpoint is not None:
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        channels, residual_blocks = dimensions_from_state_dict(
+            checkpoint["model_state_dict"], prefix="actor."
+        )
+    else:
+        channels, residual_blocks = TEACHER_CHANNELS, TEACHER_RESIDUAL_BLOCKS
+    model = Ahc015PpoNet(channels, residual_blocks).to(device)
+    if args.checkpoint is not None:
+        load_checkpoint(args.checkpoint, model=model, map_location=device)
 
     rollout_turn_seconds, storage = benchmark_rollout_turn(
         model, device, args.episodes, args.inference_batch_size, rng
     )
     started = time.perf_counter()
-    storage.fill(0)
+    for array in storage:
+        array.fill(0)
     buffer_write_seconds = time.perf_counter() - started
     update_seconds = benchmark_updates(model, device, args.batch_size, args.update_batches, rng)
 
@@ -203,7 +240,7 @@ def main() -> None:
         "episodes": args.episodes,
         "rollout_turn_seconds": rollout_turn_seconds,
         "estimated_rollout_seconds": estimated_rollout,
-        "buffer_gib": storage.nbytes / (1024**3),
+        "buffer_gib": sum(array.nbytes for array in storage) / (1024**3),
         "buffer_full_write_seconds": buffer_write_seconds,
         "measured_update_batches": args.update_batches,
         "update_seconds": update_seconds,

@@ -9,11 +9,12 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 from ahc_ml.checkpoint import load_checkpoint
 from ahc_ml.device import select_device
 
 from .game import EpisodeState, official_score
-from .model import FILM_PARAMETER_NAMES, Ahc015ValueNet
+from .model import Ahc015ValueNet, dimensions_from_state_dict
 from .simulation import evaluate_policy, evaluate_random_policy, generate_cases
 
 ACTION_FROM_CHAR = {"F": 0, "B": 1, "L": 2, "R": 3}
@@ -123,13 +124,10 @@ def main() -> None:
         summarize("phi-greedy", greedy.scores),
     ]
     if args.checkpoint is not None:
-        model = Ahc015ValueNet().to(device)
-        load_checkpoint(
-            args.checkpoint,
-            model=model,
-            map_location=device,
-            allowed_missing_keys=FILM_PARAMETER_NAMES,
-        )
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        channels, residual_blocks = dimensions_from_state_dict(checkpoint["model_state_dict"])
+        model = Ahc015ValueNet(channels, residual_blocks).to(device)
+        load_checkpoint(args.checkpoint, model=model, map_location=device)
         learned = evaluate_policy(
             model,
             device,

@@ -6,12 +6,11 @@ use crate::Tensor;
 
 const SIDE: usize = 10;
 const CELLS: usize = SIDE * SIDE;
-const FEATURE_CHANNELS: usize = 18;
-const SPATIAL_CHANNELS: usize = 15;
+const FEATURE_CHANNELS: usize = 15;
+const SPATIAL_CHANNELS: usize = 12;
 const SEQUENCE_CHANNELS: usize = 3;
-const CHANNELS: usize = 144;
-const BLOCKS: usize = 9;
-const FUSION_UNITS: usize = CHANNELS * 2;
+const CHANNELS: usize = 128;
+const BLOCKS: usize = 8;
 
 struct Linear {
     weight: Array2<f32>,
@@ -26,16 +25,16 @@ struct ResidualBlock {
 
 /// Fixed AHC015 afterstate residual-value network.
 ///
-/// Input is contiguous NCHW `(N, 18, 10, 10)`. The returned value is the
-/// learned residual `G(W)`; callers add the analytic connectedness potential.
+/// Input is contiguous board `(N, 12, 10, 10)` followed by future sequence
+/// `(N, 3, 100)`. The returned value is the learned residual `G(W)`; callers
+/// add the analytic connectedness potential.
 pub struct Ahc015ValueNet {
     stem_weight: Array4<f32>,
     stem_bias: Array1<f32>,
     blocks: Vec<ResidualBlock>,
     future_fc1: Linear,
     future_fc2: Linear,
-    film: Option<Linear>,
-    fusion_fc: Linear,
+    film: Linear,
     output: Linear,
 }
 
@@ -94,7 +93,7 @@ fn take_linear(
 }
 
 impl Ahc015ValueNet {
-    pub const PARAMETER_COUNT: usize = 409_969;
+    pub const PARAMETER_COUNT: usize = 244_481;
     pub const INPUT_LENGTH: usize = FEATURE_CHANNELS * CELLS;
 
     pub fn from_tensors(mut tensors: HashMap<String, Tensor>) -> Result<Self, String> {
@@ -167,13 +166,8 @@ impl Ahc015ValueNet {
             SEQUENCE_CHANNELS * CELLS,
         )?;
         let future_fc2 = take_linear(&mut tensors, "future_fc2", CHANNELS, CHANNELS)?;
-        let film = if tensors.contains_key("film.weight") {
-            Some(take_linear(&mut tensors, "film", CHANNELS * 2, CHANNELS)?)
-        } else {
-            None
-        };
-        let fusion_fc = take_linear(&mut tensors, "fusion_fc", FUSION_UNITS, CHANNELS * 2)?;
-        let output = take_linear(&mut tensors, "output", 1, FUSION_UNITS)?;
+        let film = take_linear(&mut tensors, "film", CHANNELS * 2, CHANNELS)?;
+        let output = take_linear(&mut tensors, "output", 1, CHANNELS)?;
 
         if !tensors.is_empty() {
             let mut names = tensors.keys().cloned().collect::<Vec<_>>();
@@ -188,7 +182,6 @@ impl Ahc015ValueNet {
             future_fc1,
             future_fc2,
             film,
-            fusion_fc,
             output,
         })
     }
@@ -253,18 +246,16 @@ impl Ahc015ValueNet {
         }
         let future = linear_relu(future, &self.future_fc1);
         let future = linear_relu(future, &self.future_fc2);
-        if let Some(film_layer) = &self.film {
-            let mut film = future.dot(&film_layer.weight.t());
-            add_bias(&mut film, &film_layer.bias);
-            for sample in 0..batch {
-                for cell in 0..CELLS {
-                    let row = sample * CELLS + cell;
-                    for channel in 0..CHANNELS {
-                        let gamma = film[(sample, channel)];
-                        let beta = film[(sample, CHANNELS + channel)];
-                        activation[(row, channel)] =
-                            activation[(row, channel)] * (1.0 + gamma) + beta;
-                    }
+        let mut film = future.dot(&self.film.weight.t());
+        add_bias(&mut film, &self.film.bias);
+        for sample in 0..batch {
+            for cell in 0..CELLS {
+                let row = sample * CELLS + cell;
+                for channel in 0..CHANNELS {
+                    let gamma = film[(sample, channel)];
+                    let beta = film[(sample, CHANNELS + channel)];
+                    activation[(row, channel)] =
+                        activation[(row, channel)] * (1.0 + gamma) + beta;
                 }
             }
         }
@@ -324,15 +315,7 @@ impl Ahc015ValueNet {
         }
         board_embedding.mapv_inplace(|value| value / CELLS as f32);
 
-        let mut fusion = Array2::<f32>::zeros((batch, CHANNELS * 2));
-        for sample in 0..batch {
-            for channel in 0..CHANNELS {
-                fusion[(sample, channel)] = board_embedding[(sample, channel)];
-                fusion[(sample, CHANNELS + channel)] = future[(sample, channel)];
-            }
-        }
-        let fusion = linear_relu(fusion, &self.fusion_fc);
-        let mut output = fusion.dot(&self.output.weight.t());
+        let mut output = board_embedding.dot(&self.output.weight.t());
         for mut row in output.axis_iter_mut(Axis(0)) {
             row[0] += self.output.bias[0];
         }
@@ -406,11 +389,11 @@ mod tests {
         );
         tensors.insert("future_fc2.bias".to_string(), tensor(&[CHANNELS], 0.0));
         tensors.insert(
-            "fusion_fc.weight".to_string(),
-            tensor(&[FUSION_UNITS, CHANNELS * 2], 0.0),
+            "film.weight".to_string(),
+            tensor(&[CHANNELS * 2, CHANNELS], 0.0),
         );
-        tensors.insert("fusion_fc.bias".to_string(), tensor(&[FUSION_UNITS], 0.0));
-        tensors.insert("output.weight".to_string(), tensor(&[1, FUSION_UNITS], 0.0));
+        tensors.insert("film.bias".to_string(), tensor(&[CHANNELS * 2], 0.0));
+        tensors.insert("output.weight".to_string(), tensor(&[1, CHANNELS], 0.0));
         tensors.insert("output.bias".to_string(), tensor(&[1], 0.0));
         tensors
     }
@@ -426,9 +409,7 @@ mod tests {
             + CHANNELS
             + CHANNELS * 2 * CHANNELS
             + CHANNELS * 2
-            + FUSION_UNITS * CHANNELS * 2
-            + FUSION_UNITS
-            + FUSION_UNITS
+            + CHANNELS
             + 1;
         assert_eq!(count, Ahc015ValueNet::PARAMETER_COUNT);
     }

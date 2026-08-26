@@ -920,3 +920,17 @@
   524,288 byte制限を超える。FiLMモデルは引き続きそのままでは提出できない
 - 判断: 独立評価で明確に改善し、固定評価bestも最終iterationで更新されたため、rollout 4,096・1 epochを
   採用する。最新float actorを`outputs/ahc015/ppo-20260825-105935/best.pt`へ更新する
+
+## ppo-20260826-000916
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/ppo-20260826-000916`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15027
+- wall-clock limit: 10.000 hours
+- W&B: online, run ID `kw5wd7ua`
+- status: time limit reached
+- elapsed: 12.718 hours
+- updates: 1188
+- best paired gain: 150311.695

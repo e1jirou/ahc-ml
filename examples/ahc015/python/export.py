@@ -7,7 +7,13 @@ import torch
 from ahc_ml.checkpoint import load_checkpoint
 from ahc_ml.export import export_quantized_state_dict, export_state_dict
 
-from .model import FILM_PARAMETER_NAMES, PARAMETER_COUNT, Ahc015ValueNet, parameter_count
+from .model import (
+    STUDENT_CHANNELS,
+    STUDENT_RESIDUAL_BLOCKS,
+    Ahc015ValueNet,
+    dimensions_from_state_dict,
+    parameter_count,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,22 +37,27 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
-    model = Ahc015ValueNet()
-    if parameter_count(model) != PARAMETER_COUNT:
-        raise RuntimeError("AHC015 model parameter count changed unexpectedly")
     if args.checkpoint is not None:
-        load_checkpoint(
-            args.checkpoint,
-            model=model,
-            allowed_missing_keys=FILM_PARAMETER_NAMES,
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        channels, residual_blocks = dimensions_from_state_dict(checkpoint["model_state_dict"])
+    else:
+        channels, residual_blocks = STUDENT_CHANNELS, STUDENT_RESIDUAL_BLOCKS
+    if (channels, residual_blocks) != (STUDENT_CHANNELS, STUDENT_RESIDUAL_BLOCKS):
+        raise ValueError(
+            "Rust export only supports the 128-channel, 8-block student model; "
+            "distill the teacher before exporting"
         )
+    model = Ahc015ValueNet(channels, residual_blocks)
+    if args.checkpoint is not None:
+        load_checkpoint(args.checkpoint, model=model)
 
+    parameters = parameter_count(model)
     metadata = {
-        "architecture": "ahc015-ppo-actor-144x9-film-v2",
+        "architecture": f"ahc015-ppo-actor-{channels}x{residual_blocks}-film-v3",
         "training_algorithm": "ppo",
-        "channels": 144,
-        "residual_blocks": 9,
-        "parameter_count": PARAMETER_COUNT,
+        "channels": channels,
+        "residual_blocks": residual_blocks,
+        "parameter_count": parameters,
         "checkpoint": str(args.checkpoint) if args.checkpoint is not None else None,
         "zero_residual_baseline": args.checkpoint is None,
     }

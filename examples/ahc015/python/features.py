@@ -18,9 +18,10 @@ from .game import (
     potential,
 )
 
-FEATURE_CHANNELS = 18
-SPATIAL_CHANNELS = 15
-SEQUENCE_CHANNEL_START = 15
+BOARD_CHANNELS = 12
+FUTURE_CHANNELS = 3
+FUTURE_LENGTH = CELL_COUNT
+POTENTIAL_CHANNEL = 11
 
 
 def dynamic_flavor_mapping(flavors: NDArray[np.uint8], placed: int) -> NDArray[np.uint8]:
@@ -108,7 +109,7 @@ def encode_afterstates(
     actions: Sequence[int] | NDArray[np.int64],
     placed: Sequence[int] | NDArray[np.int64] | int,
     flavor_sequences: Sequence[NDArray[np.uint8]] | NDArray[np.uint8],
-) -> NDArray[np.float32]:
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     boards_array = np.asarray(boards, dtype=np.uint8).reshape(-1, SIDE, SIDE)
     actions_array = np.asarray(actions, dtype=np.int64).reshape(-1)
     if np.isscalar(placed):
@@ -121,7 +122,10 @@ def encode_afterstates(
     if not (len(boards_array) == len(actions_array) == len(placed_array) == len(flavors_array)):
         raise ValueError("afterstate batch fields have different lengths")
 
-    features = np.zeros((len(boards_array), FEATURE_CHANNELS, SIDE, SIDE), dtype=np.float32)
+    board_features = np.zeros((len(boards_array), BOARD_CHANNELS, SIDE, SIDE), dtype=np.float32)
+    future_features = np.zeros(
+        (len(boards_array), FUTURE_CHANNELS, FUTURE_LENGTH), dtype=np.float32
+    )
     for sample, (board, action, turn, flavors) in enumerate(
         zip(boards_array, actions_array, placed_array, flavors_array, strict=True)
     ):
@@ -129,20 +133,19 @@ def encode_afterstates(
         mapping = dynamic_flavor_mapping(flavors, turn)
         normalized = normalized_board(board, int(action), flavors, turn)
         for flavor in range(1, 4):
-            features[sample, flavor - 1] = normalized == flavor
-        features[sample, 3] = normalized == 0
-        features[sample, 4:7] = component_size_planes(normalized)
-        features[sample, 7].fill(turn / CELL_COUNT)
+            board_features[sample, flavor - 1] = normalized == flavor
+        board_features[sample, 3] = normalized == 0
+        board_features[sample, 4:7] = component_size_planes(normalized)
+        board_features[sample, 7].fill(turn / CELL_COUNT)
 
-        totals = flavor_totals(flavors)
         remaining = np.bincount(flavors[turn:], minlength=4)[1:]
         for original in range(3):
             canonical = int(mapping[original + 1]) - 1
-            features[sample, 8 + canonical].fill(totals[original] / CELL_COUNT)
-            features[sample, 11 + canonical].fill(remaining[original] / CELL_COUNT)
-        features[sample, 14].fill(potential(board, denominator(flavors)))
+            board_features[sample, 8 + canonical].fill(remaining[original] / CELL_COUNT)
+        board_features[sample, POTENTIAL_CHANNEL].fill(potential(board, denominator(flavors)))
 
-        for offset, original in enumerate(flavors[turn:]):
+        for position in range(turn, CELL_COUNT):
+            original = flavors[position]
             canonical = int(mapping[int(original)]) - 1
-            features[sample, SEQUENCE_CHANNEL_START + canonical].reshape(-1)[offset] = 1.0
-    return features
+            future_features[sample, canonical, position] = 1.0
+    return board_features, future_features

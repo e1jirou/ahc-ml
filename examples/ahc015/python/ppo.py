@@ -6,7 +6,13 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from .features import FEATURE_CHANNELS, encode_afterstates
+from .features import (
+    BOARD_CHANNELS,
+    FUTURE_CHANNELS,
+    FUTURE_LENGTH,
+    POTENTIAL_CHANNEL,
+    encode_afterstates,
+)
 from .game import ACTION_COUNT, CELL_COUNT, SIDE, afterstates, denominator, place_at_rank, potential
 from .model import Ahc015PpoNet
 from .simulation import EvaluationResult
@@ -14,12 +20,13 @@ from .simulation import EvaluationResult
 
 @dataclass(frozen=True, slots=True)
 class PpoRollout:
-    # All planes except plane 14 are exact multiples of 1 / CELL_COUNT.  Plane
-    # 14 is the candidate potential and is reconstructed from the lossless
+    # All board planes except the potential plane are exact multiples of
+    # 1 / CELL_COUNT. The potential plane is reconstructed from the lossless
     # float32 candidate_potentials array before each update.  Keeping the large
     # on-policy buffer in this compact form makes 4096-episode rollouts fit in
     # memory without changing the model inputs.
-    features: NDArray[np.uint8]
+    board_features: NDArray[np.uint8]
+    future_features: NDArray[np.uint8]
     candidate_potentials: NDArray[np.float32]
     actions: NDArray[np.int64]
     old_log_probs: NDArray[np.float32]
@@ -76,8 +83,12 @@ def collect_ppo_rollout(
     boards = np.zeros((episodes, SIDE, SIDE), dtype=np.uint8)
     score_denominators = np.asarray([denominator(row) for row in flavors])
 
-    feature_storage = np.empty(
-        (CELL_COUNT - 1, episodes, ACTION_COUNT, FEATURE_CHANNELS, SIDE, SIDE),
+    board_storage = np.empty(
+        (CELL_COUNT - 1, episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE),
+        dtype=np.uint8,
+    )
+    future_storage = np.empty(
+        (CELL_COUNT - 1, episodes, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH),
         dtype=np.uint8,
     )
     potential_steps: list[NDArray[np.float32]] = []
@@ -102,9 +113,13 @@ def collect_ppo_rollout(
         actions_for_features = np.tile(np.arange(ACTION_COUNT, dtype=np.uint8), episodes)
         placed = np.full(episodes * ACTION_COUNT, turn + 1, dtype=np.uint8)
         repeated_flavors = np.repeat(flavors, ACTION_COUNT, axis=0)
-        features = encode_afterstates(
+        board_features, future_features = encode_afterstates(
             flat_candidates, actions_for_features, placed, repeated_flavors
-        ).reshape(episodes, ACTION_COUNT, FEATURE_CHANNELS, SIDE, SIDE)
+        )
+        board_features = board_features.reshape(episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
+        future_features = future_features.reshape(
+            episodes, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH
+        )
         candidate_potentials = np.empty((episodes, ACTION_COUNT), dtype=np.float32)
         for episode in range(episodes):
             for action in range(ACTION_COUNT):
@@ -117,9 +132,10 @@ def collect_ppo_rollout(
         with torch.inference_mode():
             for start in range(0, episodes, episode_batch_size):
                 stop = min(start + episode_batch_size, episodes)
-                input_tensor = torch.from_numpy(features[start:stop]).to(device)
+                board_tensor = torch.from_numpy(board_features[start:stop]).to(device)
+                future_tensor = torch.from_numpy(future_features[start:stop]).to(device)
                 potential_tensor = torch.from_numpy(candidate_potentials[start:stop]).to(device)
-                logits, values = model(input_tensor, potential_tensor, logit_scale)
+                logits, values = model(board_tensor, future_tensor, potential_tensor, logit_scale)
                 probabilities[start:stop] = torch.softmax(logits, dim=1).cpu().numpy()
                 values_array[start:stop] = values.cpu().numpy()
         chosen = _sample_actions(probabilities, rng)
@@ -128,10 +144,11 @@ def collect_ppo_rollout(
 
         # The potential plane is not quantized: candidate_potentials already
         # stores the same value once per candidate, instead of 100 times.
-        features *= CELL_COUNT
-        np.rint(features, out=features)
-        feature_storage[turn] = features
-        feature_storage[turn, :, :, 14] = 0
+        board_features *= CELL_COUNT
+        np.rint(board_features, out=board_features)
+        board_storage[turn] = board_features
+        board_storage[turn, :, :, POTENTIAL_CHANNEL] = 0
+        future_storage[turn] = future_features
         potential_steps.append(candidate_potentials)
         action_steps.append(chosen)
         log_prob_steps.append(np.log(np.maximum(chosen_probabilities, 1e-12)))
@@ -162,8 +179,11 @@ def collect_ppo_rollout(
         return np.stack(steps, axis=0).reshape(episodes * (CELL_COUNT - 1), *steps[0].shape[1:])
 
     rollout = PpoRollout(
-        features=feature_storage.reshape(
-            episodes * (CELL_COUNT - 1), ACTION_COUNT, FEATURE_CHANNELS, SIDE, SIDE
+        board_features=board_storage.reshape(
+            episodes * (CELL_COUNT - 1), ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE
+        ),
+        future_features=future_storage.reshape(
+            episodes * (CELL_COUNT - 1), ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH
         ),
         candidate_potentials=transition_major(potential_steps).astype(np.float32, copy=False),
         actions=transition_major(action_steps).astype(np.int64, copy=False),
@@ -179,7 +199,7 @@ def collect_ppo_rollout(
         "rollout/mean_reward": float(rewards.sum(axis=1).mean()),
         "rollout/mean_score": float(scores.mean()),
         "rollout/value_mean": float(values.mean()),
-        "rollout/feature_buffer_gib": feature_storage.nbytes / (1024**3),
+        "rollout/feature_buffer_gib": (board_storage.nbytes + future_storage.nbytes) / (1024**3),
     }
     return rollout, result, rollout_metrics
 
@@ -219,18 +239,21 @@ def ppo_update(
         for start in range(0, len(indices), batch_size):
             batch_indices = indices[start : start + batch_size]
             potentials = torch.from_numpy(rollout.candidate_potentials[batch_indices]).to(device)
-            features = torch.from_numpy(rollout.features[batch_indices]).to(
+            board_features = torch.from_numpy(rollout.board_features[batch_indices]).to(
                 device=device, dtype=torch.float32
             )
-            features.div_(CELL_COUNT)
-            features[:, :, 14] = potentials[:, :, None, None]
+            board_features.div_(CELL_COUNT)
+            board_features[:, :, POTENTIAL_CHANNEL] = potentials[:, :, None, None]
+            future_features = torch.from_numpy(rollout.future_features[batch_indices]).to(
+                device=device, dtype=torch.float32
+            )
             actions = torch.from_numpy(rollout.actions[batch_indices]).to(device)
             old_log_probs = torch.from_numpy(rollout.old_log_probs[batch_indices]).to(device)
             old_values = torch.from_numpy(rollout.old_values[batch_indices]).to(device)
             batch_advantages = torch.from_numpy(advantages[batch_indices]).to(device)
             returns = torch.from_numpy(rollout.returns[batch_indices]).to(device)
 
-            logits, values = model(features, potentials, logit_scale)
+            logits, values = model(board_features, future_features, potentials, logit_scale)
             distribution = torch.distributions.Categorical(logits=logits)
             log_probs = distribution.log_prob(actions)
             log_ratio = log_probs - old_log_probs

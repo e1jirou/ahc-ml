@@ -6,9 +6,8 @@
 持たず、4個のafterstateを共有ネットワークで個別に採点する。これにより盤面回転・反転と味番号の
 対称性を特徴生成側で処理でき、学習後のactorを小さいRust推論器へそのまま移せる。
 
-最初に10時間学習したPPO bestは、学習やcheckpoint選択に未使用の2,000ケースで平均698,013点だった。
-従来のBellman型afterstate学習は同じケースで607,950点であり、PPOが平均90,063点上回ったため、
-主方式をPPOへ変更する。過去の方式と棄却した実験は `experiments.md` に記録として残す。
+教師モデルをPPOでゼロから学習し、十分に性能が出た後で提出用の小型生徒モデルへ蒸留する。過去の方式と
+棄却した実験は `experiments.md` に記録として残す。
 
 ## 問題の定式化
 
@@ -99,11 +98,11 @@ L = L_policy + value_coefficient * L_value - entropy_coefficient * entropy
 
 | 項目 | 値 |
 | --- | ---: |
-| rollout episodes / iteration | 128（基本学習）、4,096（採用済み継続設定） |
-| transitions / iteration | 12,672（基本学習）、405,504（採用済み継続設定） |
-| PPO epochs | 4（基本学習）、1（採用済み継続設定） |
+| rollout episodes / iteration | 4,096 |
+| transitions / iteration | 405,504 |
+| PPO epochs | 1 |
 | minibatch size | 1,024 |
-| AdamW learning rate | `2e-4`（基本学習）、`2.5e-4`（fine-tuning）、`3e-4`（成熟モデルの継続） |
+| AdamW learning rate | `3e-4` |
 | weight decay | `1e-4` |
 | policy clip | `0.2` |
 | value clip | `0.2` |
@@ -123,7 +122,9 @@ L = L_policy + value_coefficient * L_value - entropy_coefficient * entropy
 2. 左右反転前後を辞書順比較し、小さい方を採用する。
 3. 次に出現する時刻、最終個数、初出時刻により味をcanonical IDへ写す。
 
-モデル入力は `(18, 10, 10)` の`f32`である。
+盤面入力は `(12, 10, 10)` の`f32`、未来列入力は `(3, 100)` の`f32`である。未来列の列 `k`
+（0始まり）は、配置順 `k + 1` のキャンディーのcanonical味をone-hotで表す。すでに配置済みの列は
+すべて0とする。したがって、モデルは各味がこの後いつ現れるかを100手分の順序付き列として参照できる。
 
 | channel | 個数 | 内容 |
 | --- | ---: | --- |
@@ -131,165 +132,65 @@ L = L_policy + value_coefficient * L_value - entropy_coefficient * entropy
 | 空きマス | 1 | 空きなら1 |
 | 連結成分サイズ | 3 | 所属成分サイズ / 100 |
 | ターン | 1 | `t / 100` |
-| 最終個数 | 3 | `d_i / 100` |
 | 残り個数 | 3 | 未配置個数 / 100 |
 | 現在のポテンシャル | 1 | `Phi(W)` |
-| 全未来列 | 3 | 残り味列のone-hot |
 
 未来の味列は最初から入力で与えられるので利用してよいが、未知の将来配置位置は入力してはならない。
 
 ## ネットワーク
 
-actorとcriticはそれぞれ144 channel、9個のdepthwise-separable residual blockを持つ。未来列による
-FiLMを含む実験モデルのactorは409,969 parameter、actorとcriticを合わせると819,938 parameterである。
+教師と生徒は同じ基本構造を使う。提出用の生徒は従来の144 channel・9 block構成をわずかに小さくした
+128 channel・8 blockとする。教師は256 channel・10 blockとし、1ネットワーク当たりのparameter数を
+生徒のおよそ4倍にする。actorとcriticはそれぞれ別ネットワークである。
+
+未来列は盤面特徴をFiLMで条件付けするためだけに用いる。global pooling後の特徴と結合するfusion層は持たない。
 
 ```text
-board channels 0..14:
-    Conv 3x3, 15 -> 144, ReLU
-    [DepthwiseConv 3x3, ReLU, Conv 1x1, skip, ReLU] x 9
-    Global average pooling -> 144
+width, blocks = (256, 10) (teacher) / (128, 8) (student)
 
-future channels 15..17:
+board input (12, 10, 10):
+    Conv 3x3, 12 -> width, ReLU
+    [DepthwiseConv 3x3, ReLU, Conv 1x1, skip, ReLU] x blocks
+    Global average pooling -> width
+
+future input (3, 100):
     Flatten 300
-    Linear 300 -> 144, ReLU
-    Linear 144 -> 144, ReLU
+    Linear 300 -> width, ReLU
+    Linear width -> width, ReLU
 
 future conditioning:
-    Linear 144 -> 288
-    Split into gamma, beta (144 each)
+    Linear width -> 2 * width
+    Split into gamma, beta (width each)
     Stem output h <- (1 + gamma) * h + beta
 
-fusion:
-    Concatenate -> 288
-    Linear 288 -> 288, ReLU
-    Linear 288 -> 1
+head:
+    Linear width -> 1
 ```
 
 Batch NormalizationとDropoutは使わず、学習時とRust推論時の差を避ける。
 
-## 学習結果
+## 蒸留の予定
 
-主run `ppo-20260820-010211` はMPSで10.009時間、835 iteration、43,069 gradient updateを行った。
-固定512ケースのbestはiteration 789で平均704,182点、独立2,000ケースでは次の結果だった。
-
-| 方策 | 平均スコア | `Phi`貪欲比 | 勝率 |
-| --- | ---: | ---: | ---: |
-| `Phi`貪欲 | 348,470 | 0 | - |
-| 従来Bellman版 | 607,950 | +259,480 | 97.45% |
-| PPO best | 698,013 | +349,543 | 99.55% |
-| PPO Rust int8 | 693,493 | +345,023 | 99.30% |
-
-最後20回の固定評価は平均685,794、標準偏差7,766、範囲35,614だった。従来方式より安定したが、
-目標の平均80万には約10.2万点届かない。
-
-その後、rollout 128局、batch 1,024、learning rate `2e-4`へ変更し、4時間runのbestからさらに
-10時間継続した。新bestは固定512ケースで725,449点、未使用の独立2,000ケースで723,675点となった。
-同じ独立ケース上で最初の10時間モデルは693,826点であり、新モデルが29,849 ±2,810点上回った。
-
-さらに上記bestからlearning rateだけを`2.5e-4`へ上げて2時間継続した。固定512ケースbestは
-734,300点（+8,851）、別の未使用2,000ケースでは728,636点となり、同じケース上の継続元best
-722,045点を+6,590点上回った。56 iteration中24回はKL判定により3 epochで終了し、平均最適化時間も
-113.1秒から100.0秒へ短縮した。KL平均0.0222、clip fraction 13.8%で破綻は見られないため、
-初期状態からは`rollout 128 / batch 1,024 / learning rate 2e-4`で学習し、成熟したbestを`2.5e-4`で
-fine-tuningする2段階を標準手順とする。`2.5e-4`を初期状態から使う実験はしていない。このfloat actorも
-提出モデルの更新候補となったが、この時点ではRustへ埋め込まれていたのは上表の初期PPOモデルだった。
-
-このbestを現行global-average構造のまま`2.5e-4`でさらに10時間継続したところ、固定512ケースbestは
-経過7.64時間で745,845点、未使用の独立2,000ケースでは745,457点となった。同じ独立ケース上の
-継続元best 729,784点を+15,672 ±2,510点上回ったため、新しいglobal-average float actorとして採用する。
-best更新は7時間台まで続いたので継続開始時点では飽和していなかった。一方、最後2.4時間はbest更新が
-なく、最後10評価の平均は733,351点だったため、終盤は飽和へ近づいた兆候があるが完全な飽和とは
-断定しない。新しい構造・特徴量は、この10時間runと同じ開始checkpoint・seed・時間で比較する。
-
-続いて初期盤面の多様性を増やすため、`rollout 1024 / minibatch 1024 / 2 epochs`へ変更して8時間
-継続した。固定512ケースbestは773,498点、未使用の独立2,000ケースでは763,408点となり、同じケース上の
-継続元best 739,780点を+23,628 ±2,365点上回った。固定評価の後半5回平均も前半より6,657点高く、
-単なる序盤の上振れではないため採用する。10時間換算のoptimizer update数をほぼ維持しつつ、1回の
-on-policy rolloutで見る初期盤面を8倍に増やしたことが有効だったと考えられる。最新float actorは
-`outputs/ahc015/ppo-20260822-125821/best.pt`となった。
-
-このbestからlearning rateだけを`2.5e-4`から`3e-4`へ上げて10時間継続した。固定512ケースbestは
-最後の固定評価となる経過9.71時間で783,207点、未使用の独立2,000ケースでは780,098点となり、同じ
-ケース上の継続元best 764,590点を+15,509 ±2,198点上回ったため採用する。新しい最新float actorは
-`outputs/ahc015/ppo-20260822-234223/best.pt`である。ただし同じ開始checkpointを`2.5e-4`で継続する
-対照runはなく、平均KLも0.0116から0.0114へわずかに下がったため、改善をlearning rate変更だけの効果とは
-断定できない。
-
-さらに同じ`3e-4`設定で10時間継続した。固定512ケースbestは時間上限後の最終評価で788,932点、未使用の
-独立2,000ケースでは787,369点となり、同じケース上の継続元best 780,157点を+7,212 ±2,196点上回ったため
-採用する。最新float actorは`outputs/ahc015/ppo-20260823-225410/best.pt`である。改善幅は前回10時間の
-+15,509点から縮小したが、後半5回の固定評価平均は前半より7,047点高く、完全な飽和にはまだ達していない。
-
-同じ設定でもう10時間継続すると、固定512ケースbestはiteration 759で795,693点、未使用の独立2,000ケース
-では788,335点となった。同じケース上の継続元best 786,175点との差は+2,160 ±2,046点であり、改善方向では
-あるため最新float actorを`outputs/ahc015/ppo-20260824-095458/best.pt`へ更新する。ただし独立評価差は
-標準誤差と同程度で、固定評価の後半5回平均も前半より2,717点低く、残り約5時間はbestを更新しなかった。
-このため、現行global-average構造を同じ設定で継続するだけの学習は概ね飽和したと判断する。
-
-このbestへ未来列からCNNを条件付けする直接FiLMを追加して10時間継続した。固定512ケースbestは
-797,602点、未使用の独立2,000ケースでは791,702点となり、同じケース上の継続元best 789,324点との差は
-+2,377 ±2,036点だった。単純継続との差は明確でないが絶対スコアは改善方向なので、
-`outputs/ahc015/ppo-20260824-230503/best.pt`を最新float actorとして仮採用する。
-
-このFiLM bestから、rolloutを1,024局・2 epochsから4,096局・1 epochへ変更して10時間継続した。
-全特徴をfloat32で保持すると約10.88 GiBに加えて巨大な一時copyが必要になるため、1/100刻みの特徴面を
-uint8で保存し、potential面だけlosslessなfloat32配列からminibatch時に復元した。bufferは2.72 GiBとなり、
-rollout推論も1,024局ずつに分割した。24 iterationで約973万transitionを収集し、固定512ケースbestは
-最終iterationで798,724点となった。未使用の独立2,000ケースでは797,558点で、同じケース上の継続元
-791,310点を+6,248 ±2,067点上回った。改善が明確で後半も悪化していないため、rollout 4,096・1 epochを
-採用し、最新float actorを`outputs/ahc015/ppo-20260825-105935/best.pt`へ更新する。
-
-global average版bestから`2x2` spatial poolingへ拡張する4時間実験も行った。独立2,000ケースでは
-global average版を+5,784 ±2,522点上回ったが、bestは開始0.32時間時点で、その後4時間まで改善しなかった。
-また、別seedで継続したglobal average版の対照runがなく、改善をspatial headの効果と分離できない。
-新しい表現を利用した学習が成功した根拠として不十分なため、この変更は棄却した。
-
-## 停滞対策の検証と現在の課題
-
-旧設定`rollout 32 / batch 256 / learning rate 1e-4`では、固定評価がiteration 49で621,150、99で
-661,221、199で665,252まで伸びた後、best 704,182へ到達するまで約7時間を要した。小さいon-policy
-batchでは状態分布の更新が遅いことを主因候補として、次の順に検証した。
-
-1. rolloutを128局、batchを1,024へ拡大すると、`lr=1e-4`では平均KLが0.0065まで下がり、同一時間・
-   同一transition数とも旧設定を下回った。大batch化だけでは更新圧が不足した。
-2. `lr=2e-4`へ上げると平均KLは0.0147となり、4時間時点で旧設定を約7,500点上回った。さらに10時間
-   継続して独立評価723,675点に到達し、rollout拡大とlearning rate調整の組合せを採用した。
-3. `lr=2.5e-4`で2時間継続すると独立評価がさらに6,590点改善した。56 iteration中24回は3 epochで
-   KL判定に達し、平均最適化時間も11.6%短縮した。平均KL 0.0222、clip fraction 13.8%であり、
-   target KL 0.03に対して適度な更新圧になっている。
-
-旧small-batch由来の停滞は改善された。追加で最新bestからentropy係数だけを`0.01`から`0.02`へ上げた
-2時間実験では、学習entropyは平均0.343から0.402へ上昇したが、固定評価bestは4,637点、独立2,000局は
-4,708点悪化した。このためentropy係数は`0.01`を維持し、今後は次の順で検証する。
-
-1. **大型teacherをrollout 4,096で学習する。** 現行モデルでは独立評価が+6,248 ±2,067点改善し、
-   unique transition throughputもrollout 1,024版より約59%高くなった。次は提出制約を外してchannel数や
-   residual block数を数倍規模へ拡大し、現行モデルを明確に上回るteacherを作る。
-2. **大型teacherから提出モデルへ蒸留する。** teacherのsoftな4方向分布と候補間rankingを144 channel以下の
-   studentへ学習させ、student自身の訪問状態にもteacherを適用するDAgger型を候補とする。teacherが現行
-   studentを独立評価で明確に上回ることを蒸留開始条件とする。
-3. **criticを改善する。** 現在は4候補値の単純平均である。候補特徴をpoolする専用state-value head、
-   value loss係数、GAE lambdaを比較する。explained varianceは最新runで0.98前後なので優先度は低い。
-
-W&Bにはscoreだけでなく、累積environment transitions、gradient update、KL early stop率、entropy、
-clip fraction、score/environment-stepを記録し、何が改善したかを判別できるようにする。
+教師のPPO学習後、教師が出す4方向のsoftな方策分布と候補間の順位を教師信号として、生徒actorを学習する。
+まずは教師のrolloutで得た状態を用い、必要なら生徒自身が訪問した状態にも教師を適用するDAgger型の蒸留を
+追加する。独立評価で教師が生徒を明確に上回ることを、蒸留を開始する条件とする。
 
 ## 提出
 
 学習時は確率的に行動するが、提出時は4候補の `Phi + G_theta` が最大の方向を選ぶ。100ターン目は
 盤面が埋まっているのでモデルを呼ばず`F`を返す。actorをper-tensor int8量子化してRustソースへ
 埋め込み、起動時にf32へ展開する。量子化後はPython float版との候補一致率と公式スコア差を独立ケースで
-確認する。現在の提出モデルの未使用2,000ケースではfloat版779,902点に対しRust int8版781,754点で、差は
-+1,853 ±1,050点、公式スコアの完全一致率は72.3%だった。量子化による有意な劣化はないため採用する。
-今後のper-output-channel量子化は、明確な量子化劣化が再び観測された場合のみ検討する。
+確認する。
 
-採用した最新float actor `ppo-20260825-105935/best.pt`は、量子化binaryが402,138 bytesである一方、
-base93化したRust model dataは532,310 bytesとなり、それだけで提出サイズ制限を超える。提出モデルは
-まだ更新せず、大型teacherから提出可能なstudentへ蒸留した後に差し替える。
+提出物には蒸留済みの生徒actorだけを含める。量子化binaryとRustへ埋め込むデータを含めて提出サイズ制限を
+満たすこと、2秒の実行時間制限内であることを独立ケースで確認する。
 
-144 channelモデルのAtCoder実測は約0.9秒、最新提出ファイルのローカル実測は平均0.564秒で、2秒制限には
-余裕がある。PPO単体で平均80万へ近づけることを優先し、その後に最後5手程度のexpectimaxや、
-不確実な局面だけのplayoutを追加する。
+計測の結果、実行時間に余裕がある場合は、その時間を終盤の追加探索に使うことを検討する。候補は、未知の
+配置位置をsampleして各方向の将来スコアを比較するモンテカルロ法と、残り手数が十分に少ない最終盤に、
+起こり得る配置位置を列挙して各方向の厳密な期待値を計算する方法の2つとする。適用するターン数と探索量は、
+2秒の制限を安定して満たす範囲で決める。
+
+教師の性能を優先して学習し、その後に生徒への蒸留と提出用量子化を行う。
 
 ## 実装上の確認事項
 

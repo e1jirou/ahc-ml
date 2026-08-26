@@ -38,18 +38,21 @@ def generate_cases(
 
 def _predict_residuals(
     model: torch.nn.Module | None,
-    features: NDArray[np.float32],
+    board_features: NDArray[np.float32],
+    future_features: NDArray[np.float32],
     device: torch.device,
     inference_batch_size: int,
 ) -> NDArray[np.float32]:
     if model is None:
-        return np.zeros(len(features), dtype=np.float32)
+        return np.zeros(len(board_features), dtype=np.float32)
     predictions = []
     model.eval()
     with torch.inference_mode():
-        for start in range(0, len(features), inference_batch_size):
-            inputs = torch.from_numpy(features[start : start + inference_batch_size]).to(device)
-            predictions.append(model(inputs).cpu().numpy())
+        for start in range(0, len(board_features), inference_batch_size):
+            stop = start + inference_batch_size
+            boards = torch.from_numpy(board_features[start:stop]).to(device)
+            futures = torch.from_numpy(future_features[start:stop]).to(device)
+            predictions.append(model(boards, futures).cpu().numpy())
     return np.concatenate(predictions).astype(np.float32, copy=False)
 
 
@@ -78,10 +81,16 @@ def evaluate_policy(
             actions = np.tile(np.arange(ACTION_COUNT, dtype=np.uint8), episodes)
             placed = np.full(episodes * ACTION_COUNT, turn + 1, dtype=np.uint8)
             repeated_flavors = np.repeat(flavors, ACTION_COUNT, axis=0)
-            features = encode_afterstates(flat, actions, placed, repeated_flavors)
-            residuals = _predict_residuals(model, features, device, inference_batch_size).reshape(
-                episodes, ACTION_COUNT
+            board_features, future_features = encode_afterstates(
+                flat, actions, placed, repeated_flavors
             )
+            residuals = _predict_residuals(
+                model,
+                board_features,
+                future_features,
+                device,
+                inference_batch_size,
+            ).reshape(episodes, ACTION_COUNT)
         values = residuals
         for episode in range(episodes):
             score_denominator = denominator(flavors[episode])

@@ -30,6 +30,12 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class ModelConfig:
+    channels: int
+    residual_blocks: int
+
+
+@dataclass(frozen=True)
 class PpoConfig:
     gamma: float
     gae_lambda: float
@@ -58,6 +64,7 @@ class WandbConfig:
 @dataclass(frozen=True)
 class Ahc015Config:
     run: RunConfig
+    model: ModelConfig
     training: TrainingConfig
     ppo: PpoConfig
     evaluation: EvaluationConfig
@@ -77,12 +84,15 @@ def load_config(path: str | Path) -> Ahc015Config:
         values = tomllib.load(file)
     config = Ahc015Config(
         run=RunConfig(**values["run"]),
+        model=ModelConfig(**values.get("model", {"channels": 128, "residual_blocks": 8})),
         training=TrainingConfig(**values["training"]),
         ppo=PpoConfig(**values["ppo"]),
         evaluation=EvaluationConfig(**values["evaluation"]),
         wandb=WandbConfig(**values["wandb"]),
     )
     for name, value in (
+        ("model.channels", config.model.channels),
+        ("model.residual_blocks", config.model.residual_blocks),
         ("training.iterations", config.training.iterations),
         ("training.rollout_episodes", config.training.rollout_episodes),
         ("training.epochs", config.training.epochs),

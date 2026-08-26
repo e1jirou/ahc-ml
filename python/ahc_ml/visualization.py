@@ -10,7 +10,7 @@ from torchview import draw_graph
 def render_model_graph(
     model: nn.Module,
     *,
-    input_size: tuple[int, ...],
+    input_size: tuple[int, ...] | list[tuple[int, ...]],
     output_stem: str | Path,
 ) -> tuple[Path, Path]:
     """Render a model architecture graph as SVG and PNG files."""

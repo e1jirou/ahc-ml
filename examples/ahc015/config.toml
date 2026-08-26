@@ -1,16 +1,20 @@
 [run]
-seed = 15015
+seed = 15027
 device = "auto"
 deterministic = false
 output_dir = "outputs/ahc015"
 experiment_log = "examples/ahc015/docs/experiments.md"
 
+[model]
+channels = 256
+residual_blocks = 10
+
 [training]
 iterations = 1000
-rollout_episodes = 128
-epochs = 4
+rollout_episodes = 4096
+epochs = 1
 batch_size = 1024
-learning_rate = 0.0002
+learning_rate = 0.0003
 weight_decay = 0.0001
 gradient_clip_norm = 1.0
 checkpoint_interval = 5
@@ -28,7 +32,7 @@ logit_scale = 12.0
 target_kl = 0.03
 
 [evaluation]
-interval = 5
+interval = 1
 episodes = 512
 seed = 515015
 
