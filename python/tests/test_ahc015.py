@@ -49,6 +49,7 @@ from examples.ahc015.python.model import (
 )
 from examples.ahc015.python.ppo import (
     PpoRollout,
+    PpoRolloutStorage,
     collect_ppo_rollout,
     generalized_advantages,
     ppo_update,
@@ -76,9 +77,10 @@ def test_batched_placement_and_tilts_match_scalar_operations() -> None:
     flavors = rng.integers(1, 4, size=len(boards))
 
     expected_placements = np.stack(
-        [place_at_rank(board, int(rank), int(flavor)) for board, rank, flavor in zip(
-            boards, ranks, flavors, strict=True
-        )]
+        [
+            place_at_rank(board, int(rank), int(flavor))
+            for board, rank, flavor in zip(boards, ranks, flavors, strict=True)
+        ]
     )
     assert np.array_equal(place_at_ranks(boards, ranks, flavors), expected_placements)
     for action in range(ACTION_COUNT):
@@ -207,6 +209,7 @@ def test_config_and_ppo_model_shapes() -> None:
     assert config.training.rollout_episodes == 4096
     assert config.training.batch_size == 1024
     assert config.training.micro_batch_size == 128
+    assert config.training.rollout_processes == 1
     assert config.training.learning_rate == 3e-4
     assert config.ppo.gamma == 1.0
     fine_tune_config = load_config(config_directory / "config_finetune.toml")
@@ -315,6 +318,23 @@ def test_ppo_rollout_and_update_smoke() -> None:
     assert np.all(np.isfinite(rollout.advantages))
     assert np.all((result.potentials >= 0) & (result.potentials <= 1))
     assert metrics["rollout/mean_score"] > 0
+
+    explicit_storage = PpoRolloutStorage.empty(2)
+    stored_rollout, stored_result, stored_metrics = collect_ppo_rollout(
+        model,
+        torch.device("cpu"),
+        episodes=2,
+        rng=np.random.default_rng(4),
+        gamma=1.0,
+        gae_lambda=0.95,
+        logit_scale=12.0,
+        inference_batch_size=4,
+        storage=explicit_storage,
+    )
+    for field in PpoRollout.__dataclass_fields__:
+        assert np.array_equal(getattr(stored_rollout, field), getattr(rollout, field))
+    assert np.array_equal(stored_result.scores, result.scores)
+    assert stored_metrics == metrics
 
     restored_boards = torch.from_numpy(rollout.board_features[:8]).float() / CELL_COUNT
     restored_boards[:, :, POTENTIAL_CHANNEL] = torch.from_numpy(rollout.candidate_potentials[:8])[

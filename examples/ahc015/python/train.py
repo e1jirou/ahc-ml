@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import math
 import time
@@ -21,6 +22,7 @@ from .config import Ahc015Config, load_config
 from .features import BOARD_CHANNELS, FUTURE_CHANNELS, FUTURE_LENGTH
 from .game import SIDE
 from .model import STUDENT_CHANNELS, STUDENT_RESIDUAL_BLOCKS, Ahc015PpoNet, parameter_count
+from .parallel_runtime import ParallelAhc015Runtime
 from .ppo import collect_ppo_rollout, ppo_update
 from .simulation import evaluate_policy, generate_cases
 
@@ -40,6 +42,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
+    parser.add_argument("--rollout-processes", type=int, choices=(1, 2))
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--evaluation-episodes", type=int)
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"))
@@ -56,31 +59,50 @@ def append_experiment_log(path: Path, text: str) -> None:
 
 
 def evaluate(
-    model: torch.nn.Module, device: torch.device, config: Ahc015Config
+    evaluation_model: torch.nn.Module,
+    training_model: Ahc015PpoNet,
+    device: torch.device,
+    config: Ahc015Config,
+    parallel_runtime: ParallelAhc015Runtime | None,
 ) -> dict[str, float]:
     flavors, ranks = generate_cases(config.evaluation.episodes, config.evaluation.seed)
-    greedy = evaluate_policy(
-        None,
-        device,
-        flavors,
-        ranks,
-        inference_batch_size=config.training.inference_batch_size,
-    )
-    learned = evaluate_policy(
-        model,
-        device,
-        flavors,
-        ranks,
-        inference_batch_size=config.training.inference_batch_size,
-    )
-    difference = learned.scores - greedy.scores
+    if parallel_runtime is None:
+        greedy_scores = evaluate_policy(
+            None,
+            device,
+            flavors,
+            ranks,
+            inference_batch_size=config.training.inference_batch_size,
+        ).scores
+        learned_scores = evaluate_policy(
+            evaluation_model,
+            device,
+            flavors,
+            ranks,
+            inference_batch_size=config.training.inference_batch_size,
+        ).scores
+    else:
+        release_cuda_cache()
+        greedy_scores, learned_scores = parallel_runtime.evaluate(
+            training_model,
+            flavors,
+            ranks,
+            inference_batch_size=config.training.inference_batch_size,
+        )
+    difference = learned_scores - greedy_scores
     return {
-        "evaluation/mean_score": float(learned.scores.mean()),
-        "evaluation/greedy_mean_score": float(greedy.scores.mean()),
+        "evaluation/mean_score": float(learned_scores.mean()),
+        "evaluation/greedy_mean_score": float(greedy_scores.mean()),
         "evaluation/paired_gain": float(difference.mean()),
         "evaluation/paired_gain_se": float(difference.std(ddof=1) / math.sqrt(len(difference))),
         "evaluation/win_rate": float(np.mean(difference > 0)),
     }
+
+
+def release_cuda_cache() -> None:
+    for index in range(torch.cuda.device_count()):
+        with torch.cuda.device(index):
+            torch.cuda.empty_cache()
 
 
 def export_actor(
@@ -141,9 +163,12 @@ def apply_overrides(config: Ahc015Config, args: argparse.Namespace) -> Ahc015Con
             else config.training.micro_batch_size
         ),
         data_parallel=(
-            args.data_parallel
-            if args.data_parallel is not None
-            else config.training.data_parallel
+            args.data_parallel if args.data_parallel is not None else config.training.data_parallel
+        ),
+        rollout_processes=(
+            args.rollout_processes
+            if args.rollout_processes is not None
+            else config.training.rollout_processes
         ),
         epochs=args.epochs if args.epochs is not None else config.training.epochs,
     )
@@ -168,6 +193,7 @@ def main() -> None:
         ("rollout_episodes", config.training.rollout_episodes),
         ("batch_size", config.training.batch_size),
         ("micro_batch_size", config.training.micro_batch_size),
+        ("rollout_processes", config.training.rollout_processes),
         ("epochs", config.training.epochs),
         ("evaluation_episodes", config.evaluation.episodes),
     ):
@@ -268,6 +294,27 @@ def main() -> None:
         evaluation_model = torch.nn.DataParallel(model.actor)
         print(f"data parallel: {torch.cuda.device_count()} CUDA devices")
 
+    parallel_runtime = None
+    if config.training.rollout_processes > 1:
+        if device.type != "cuda":
+            raise RuntimeError("parallel rollout requires CUDA")
+        if config.training.rollout_episodes % config.training.rollout_processes:
+            raise ValueError("rollout episodes must be divisible by rollout processes")
+        if config.evaluation.episodes % config.training.rollout_processes:
+            raise ValueError("evaluation episodes must be divisible by rollout processes")
+        parallel_runtime = ParallelAhc015Runtime(
+            workers=config.training.rollout_processes,
+            episodes=config.training.rollout_episodes,
+            channels=config.model.channels,
+            residual_blocks=config.model.residual_blocks,
+            seed=config.run.seed + 10_000,
+        )
+        print(
+            f"parallel rollout/evaluation: {config.training.rollout_processes} "
+            "independent CPU/GPU pipelines"
+        )
+        atexit.register(parallel_runtime.close)
+
     last_metrics: dict[str, float] = {"training/update": float(update)}
     last_iteration = start_iteration - 1
     training_started = time.monotonic()
@@ -290,16 +337,26 @@ def main() -> None:
             break
         iteration_started = time.monotonic()
         rollout_started = time.monotonic()
-        rollout, _, rollout_metrics = collect_ppo_rollout(
-            execution_model,
-            device,
-            config.training.rollout_episodes,
-            rng,
-            gamma=config.ppo.gamma,
-            gae_lambda=config.ppo.gae_lambda,
-            logit_scale=config.ppo.logit_scale,
-            inference_batch_size=config.training.inference_batch_size,
-        )
+        if parallel_runtime is None:
+            rollout, _, rollout_metrics = collect_ppo_rollout(
+                execution_model,
+                device,
+                config.training.rollout_episodes,
+                rng,
+                gamma=config.ppo.gamma,
+                gae_lambda=config.ppo.gae_lambda,
+                logit_scale=config.ppo.logit_scale,
+                inference_batch_size=config.training.inference_batch_size,
+            )
+        else:
+            release_cuda_cache()
+            rollout, _, rollout_metrics = parallel_runtime.collect(
+                model,
+                gamma=config.ppo.gamma,
+                gae_lambda=config.ppo.gae_lambda,
+                logit_scale=config.ppo.logit_scale,
+                inference_batch_size=config.training.inference_batch_size,
+            )
         environment_transitions += len(rollout)
         metrics: dict[str, float] = {
             "iteration": float(iteration),
@@ -337,7 +394,9 @@ def main() -> None:
 
         should_evaluate = (iteration + 1) % config.evaluation.interval == 0
         if should_evaluate:
-            metrics.update(evaluate(evaluation_model, device, config))
+            evaluation_started = time.monotonic()
+            metrics.update(evaluate(evaluation_model, model, device, config, parallel_runtime))
+            metrics["timing/evaluation_seconds"] = time.monotonic() - evaluation_started
             gain = metrics["evaluation/paired_gain"]
             if gain > best_gain:
                 best_gain = gain
@@ -380,7 +439,7 @@ def main() -> None:
 
     if "evaluation/paired_gain" not in last_metrics:
         print("running final paired evaluation", flush=True)
-        last_metrics.update(evaluate(evaluation_model, device, config))
+        last_metrics.update(evaluate(evaluation_model, model, device, config, parallel_runtime))
         gain = last_metrics["evaluation/paired_gain"]
         if gain > best_gain:
             best_gain = gain
@@ -409,6 +468,10 @@ def main() -> None:
             },
             step=max(last_iteration + 1, 0),
         )
+
+    if parallel_runtime is not None:
+        parallel_runtime.close()
+        atexit.unregister(parallel_runtime.close)
 
     save_checkpoint(
         output_dir / "last.pt",

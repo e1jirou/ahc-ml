@@ -29,6 +29,7 @@ class TrainingConfig:
     inference_batch_size: int
     micro_batch_size: int = 128
     data_parallel: bool = False
+    rollout_processes: int = 1
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,7 @@ def load_config(path: str | Path) -> Ahc015Config:
         ("training.epochs", config.training.epochs),
         ("training.batch_size", config.training.batch_size),
         ("training.micro_batch_size", config.training.micro_batch_size),
+        ("training.rollout_processes", config.training.rollout_processes),
         ("training.learning_rate", config.training.learning_rate),
         ("training.gradient_clip_norm", config.training.gradient_clip_norm),
         ("training.checkpoint_interval", config.training.checkpoint_interval),
@@ -117,6 +119,8 @@ def load_config(path: str | Path) -> Ahc015Config:
         _positive(name, value)
     if config.training.micro_batch_size > config.training.batch_size:
         raise ValueError("training.micro_batch_size must not exceed training.batch_size")
+    if config.training.rollout_processes not in {1, 2}:
+        raise ValueError("training.rollout_processes must be 1 or 2")
     if config.ppo.gamma != 1.0:
         raise ValueError("ppo.gamma must be 1.0 so potential shaping preserves the objective")
     if not 0 < config.ppo.gae_lambda <= 1:
