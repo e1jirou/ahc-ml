@@ -15,7 +15,7 @@ from numpy.typing import NDArray
 from .features import BOARD_CHANNELS, FUTURE_CHANNELS, FUTURE_LENGTH
 from .game import ACTION_COUNT, CELL_COUNT, SIDE
 from .model import Ahc015PpoNet
-from .ppo import PpoRollout, PpoRolloutStorage, collect_ppo_rollout
+from .ppo import PpoRollout, PpoRolloutStorage, collect_ppo_rollout, ppo_update
 from .simulation import EvaluationResult, evaluate_policy
 
 
@@ -170,6 +170,80 @@ def _worker_main(
         connection.close()
 
 
+def _cpu_tree(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_tree(item) for item in value)
+    return value
+
+
+def _ppo_worker_main(
+    connection: Connection,
+    shared_rollout: _SharedRollout,
+    channels: int,
+    residual_blocks: int,
+    training_state_bytes: bytes,
+    parameters: dict[str, Any],
+    seed: int,
+) -> None:
+    try:
+        torch.set_num_threads(1)
+        device = torch.device("cuda:0")
+        torch.cuda.set_device(device)
+        training_state = torch.load(
+            io.BytesIO(training_state_bytes), map_location="cpu", weights_only=False
+        )
+        model = Ahc015PpoNet(channels, residual_blocks).to(device)
+        model.load_state_dict(training_state["model_state_dict"])
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=parameters["learning_rate"],
+            weight_decay=parameters["weight_decay"],
+        )
+        optimizer.load_state_dict(training_state["optimizer_state_dict"])
+        execution_model: torch.nn.Module = model
+        if parameters["data_parallel"]:
+            if torch.cuda.device_count() < 2:
+                raise RuntimeError("parallel PPO requires two CUDA devices")
+            execution_model = torch.nn.DataParallel(model)
+        metrics = ppo_update(
+            execution_model,
+            optimizer,
+            shared_rollout.as_rollout(),
+            device,
+            np.random.default_rng(seed),
+            epochs=parameters["epochs"],
+            batch_size=parameters["batch_size"],
+            micro_batch_size=parameters["micro_batch_size"],
+            clip_ratio=parameters["clip_ratio"],
+            value_clip=parameters["value_clip"],
+            value_coefficient=parameters["value_coefficient"],
+            entropy_coefficient=parameters["entropy_coefficient"],
+            gradient_clip_norm=parameters["gradient_clip_norm"],
+            logit_scale=parameters["logit_scale"],
+            target_kl=parameters["target_kl"],
+        )
+        torch.cuda.synchronize()
+        updated = io.BytesIO()
+        torch.save(
+            {
+                "model_state_dict": _cpu_tree(model.state_dict()),
+                "optimizer_state_dict": _cpu_tree(optimizer.state_dict()),
+            },
+            updated,
+        )
+        connection.send(("update", metrics, updated.getvalue()))
+    except BaseException:
+        connection.send(("error", 0, traceback.format_exc()))
+    finally:
+        connection.close()
+
+
 class ParallelAhc015Runtime:
     """Independent CPU/GPU pipelines with a copy-free shared rollout buffer."""
 
@@ -195,6 +269,7 @@ class ParallelAhc015Runtime:
         self._channels = channels
         self._residual_blocks = residual_blocks
         self._seeds = [seed + worker for worker in range(workers)]
+        self._update_seed = seed + workers
         self._closed = False
 
     def _run_workers(self, command: str, payloads: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
@@ -245,6 +320,18 @@ class ParallelAhc015Runtime:
         return buffer.getvalue()
 
     @staticmethod
+    def _training_state_bytes(model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> bytes:
+        buffer = io.BytesIO()
+        torch.save(
+            {
+                "model_state_dict": _cpu_tree(model.state_dict()),
+                "optimizer_state_dict": _cpu_tree(optimizer.state_dict()),
+            },
+            buffer,
+        )
+        return buffer.getvalue()
+
+    @staticmethod
     def _raise_worker_error(message: tuple[Any, ...]) -> None:
         if message[0] == "error":
             raise RuntimeError(f"parallel worker {message[1]} failed:\n{message[2]}")
@@ -284,6 +371,73 @@ class ParallelAhc015Runtime:
             EvaluationResult(scores, potentials),
             metrics,
         )
+
+    def update(
+        self,
+        model: Ahc015PpoNet,
+        optimizer: torch.optim.Optimizer,
+        *,
+        epochs: int,
+        batch_size: int,
+        micro_batch_size: int,
+        learning_rate: float,
+        weight_decay: float,
+        clip_ratio: float,
+        value_clip: float,
+        value_coefficient: float,
+        entropy_coefficient: float,
+        gradient_clip_norm: float,
+        logit_scale: float,
+        target_kl: float,
+        data_parallel: bool,
+    ) -> dict[str, float]:
+        if self._closed:
+            raise RuntimeError("parallel runtime is closed")
+        parent, child = self._context.Pipe()
+        process = self._context.Process(
+            target=_ppo_worker_main,
+            args=(
+                child,
+                self._shared,
+                self._channels,
+                self._residual_blocks,
+                self._training_state_bytes(model, optimizer),
+                {
+                    "epochs": epochs,
+                    "batch_size": batch_size,
+                    "micro_batch_size": micro_batch_size,
+                    "learning_rate": learning_rate,
+                    "weight_decay": weight_decay,
+                    "clip_ratio": clip_ratio,
+                    "value_clip": value_clip,
+                    "value_coefficient": value_coefficient,
+                    "entropy_coefficient": entropy_coefficient,
+                    "gradient_clip_norm": gradient_clip_norm,
+                    "logit_scale": logit_scale,
+                    "target_kl": target_kl,
+                    "data_parallel": data_parallel,
+                },
+                self._update_seed,
+            ),
+        )
+        process.start()
+        child.close()
+        try:
+            response = parent.recv()
+            self._raise_worker_error(response)
+            if response[0] != "update":
+                raise RuntimeError(f"unexpected PPO worker response: {response[0]}")
+            updated = torch.load(io.BytesIO(response[2]), map_location="cpu", weights_only=False)
+            model.load_state_dict(updated["model_state_dict"])
+            optimizer.load_state_dict(updated["optimizer_state_dict"])
+            self._update_seed += 1
+            return response[1]
+        finally:
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join()
+            parent.close()
 
     def evaluate(
         self,

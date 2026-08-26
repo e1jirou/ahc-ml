@@ -82,7 +82,6 @@ def evaluate(
             inference_batch_size=config.training.inference_batch_size,
         ).scores
     else:
-        release_cuda_cache()
         greedy_scores, learned_scores = parallel_runtime.evaluate(
             training_model,
             flavors,
@@ -97,13 +96,6 @@ def evaluate(
         "evaluation/paired_gain_se": float(difference.std(ddof=1) / math.sqrt(len(difference))),
         "evaluation/win_rate": float(np.mean(difference > 0)),
     }
-
-
-def release_cuda_cache() -> None:
-    for index in range(torch.cuda.device_count()):
-        with torch.cuda.device(index):
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
 
 
 def export_actor(
@@ -245,7 +237,9 @@ def main() -> None:
         caption="AHC015 PPO actor (the critic has the same architecture)",
     )
     print(f"actor graph: {graph_svg}")
-    model = model.to(device)
+    use_parallel_runtime = config.training.rollout_processes > 1
+    model_device = torch.device("cpu") if use_parallel_runtime else device
+    model = model.to(model_device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.training.learning_rate,
@@ -257,7 +251,7 @@ def main() -> None:
     start_iteration = 0
     best_gain = -math.inf
     if args.resume is not None:
-        checkpoint = load_training_checkpoint(args.resume, model, optimizer, device)
+        checkpoint = load_training_checkpoint(args.resume, model, optimizer, model_device)
         # Optimizer checkpoints also contain their old learning rate.  Keep the
         # moments, but let the new run's config control the resumed learning rate.
         for parameter_group in optimizer.param_groups:
@@ -291,9 +285,12 @@ def main() -> None:
     if config.training.data_parallel:
         if device.type != "cuda" or torch.cuda.device_count() < 2:
             raise RuntimeError("data parallel training requires at least two CUDA devices")
-        execution_model = torch.nn.DataParallel(model)
-        evaluation_model = torch.nn.DataParallel(model.actor)
-        print(f"data parallel: {torch.cuda.device_count()} CUDA devices")
+        if use_parallel_runtime:
+            print(f"data parallel PPO worker: {torch.cuda.device_count()} CUDA devices")
+        else:
+            execution_model = torch.nn.DataParallel(model)
+            evaluation_model = torch.nn.DataParallel(model.actor)
+            print(f"data parallel: {torch.cuda.device_count()} CUDA devices")
 
     parallel_runtime = None
     if config.training.rollout_processes > 1:
@@ -350,7 +347,6 @@ def main() -> None:
                 inference_batch_size=config.training.inference_batch_size,
             )
         else:
-            release_cuda_cache()
             rollout, _, rollout_metrics = parallel_runtime.collect(
                 model,
                 gamma=config.ppo.gamma,
@@ -358,7 +354,6 @@ def main() -> None:
                 logit_scale=config.ppo.logit_scale,
                 inference_batch_size=config.training.inference_batch_size,
             )
-            release_cuda_cache()
         environment_transitions += len(rollout)
         metrics: dict[str, float] = {
             "iteration": float(iteration),
@@ -366,23 +361,42 @@ def main() -> None:
             **rollout_metrics,
         }
         optimization_started = time.monotonic()
-        update_metrics = ppo_update(
-            execution_model,
-            optimizer,
-            rollout,
-            device,
-            rng,
-            epochs=config.training.epochs,
-            batch_size=config.training.batch_size,
-            micro_batch_size=config.training.micro_batch_size,
-            clip_ratio=config.ppo.clip_ratio,
-            value_clip=config.ppo.value_clip,
-            value_coefficient=config.ppo.value_coefficient,
-            entropy_coefficient=config.ppo.entropy_coefficient,
-            gradient_clip_norm=config.training.gradient_clip_norm,
-            logit_scale=config.ppo.logit_scale,
-            target_kl=config.ppo.target_kl,
-        )
+        if parallel_runtime is None:
+            update_metrics = ppo_update(
+                execution_model,
+                optimizer,
+                rollout,
+                device,
+                rng,
+                epochs=config.training.epochs,
+                batch_size=config.training.batch_size,
+                micro_batch_size=config.training.micro_batch_size,
+                clip_ratio=config.ppo.clip_ratio,
+                value_clip=config.ppo.value_clip,
+                value_coefficient=config.ppo.value_coefficient,
+                entropy_coefficient=config.ppo.entropy_coefficient,
+                gradient_clip_norm=config.training.gradient_clip_norm,
+                logit_scale=config.ppo.logit_scale,
+                target_kl=config.ppo.target_kl,
+            )
+        else:
+            update_metrics = parallel_runtime.update(
+                model,
+                optimizer,
+                epochs=config.training.epochs,
+                batch_size=config.training.batch_size,
+                micro_batch_size=config.training.micro_batch_size,
+                learning_rate=config.training.learning_rate,
+                weight_decay=config.training.weight_decay,
+                clip_ratio=config.ppo.clip_ratio,
+                value_clip=config.ppo.value_clip,
+                value_coefficient=config.ppo.value_coefficient,
+                entropy_coefficient=config.ppo.entropy_coefficient,
+                gradient_clip_norm=config.training.gradient_clip_norm,
+                logit_scale=config.ppo.logit_scale,
+                target_kl=config.ppo.target_kl,
+                data_parallel=config.training.data_parallel,
+            )
         update += int(update_metrics["training/updates_this_iteration"])
         early_stop_count += int(update_metrics["training/early_stop"])
         metrics.update(update_metrics)
@@ -488,7 +502,7 @@ def main() -> None:
             "evaluation/best_paired_gain": best_gain,
         },
     )
-    load_checkpoint(output_dir / "best.pt", model=model.actor, map_location=device)
+    load_checkpoint(output_dir / "best.pt", model=model.actor, map_location=model_device)
     tracker.log_artifact(
         output_dir / "best.pt", name=f"{run_name}-actor-checkpoint", artifact_type="model"
     )
