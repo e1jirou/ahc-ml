@@ -111,6 +111,8 @@ def _worker_main(
     channels: int,
     residual_blocks: int,
     seed: int,
+    command: str,
+    payload: dict[str, Any],
 ) -> None:
     try:
         torch.set_num_threads(1)
@@ -119,47 +121,42 @@ def _worker_main(
         model = Ahc015PpoNet(channels, residual_blocks).to(device)
         rng = np.random.default_rng(seed)
         storage = shared_rollout.worker_storage(worker)
-        connection.send(("ready", worker))
-        while True:
-            command, payload = connection.recv()
-            if command == "close":
-                break
-            model.load_state_dict(payload["model_state_dict"])
-            if command == "collect":
-                _, result, metrics = collect_ppo_rollout(
-                    model,
-                    device,
-                    storage.actions.shape[1],
-                    rng,
-                    gamma=payload["gamma"],
-                    gae_lambda=payload["gae_lambda"],
-                    logit_scale=payload["logit_scale"],
-                    inference_batch_size=payload["inference_batch_size"],
-                    storage=storage,
-                )
-                _clear_cuda_cache(device)
-                connection.send(("collect", result.scores, result.potentials, metrics))
-            elif command == "evaluate":
-                flavors = payload["flavors"]
-                ranks = payload["ranks"]
-                greedy = evaluate_policy(
-                    None,
-                    device,
-                    flavors,
-                    ranks,
-                    inference_batch_size=payload["inference_batch_size"],
-                )
-                learned = evaluate_policy(
-                    model.actor,
-                    device,
-                    flavors,
-                    ranks,
-                    inference_batch_size=payload["inference_batch_size"],
-                )
-                _clear_cuda_cache(device)
-                connection.send(("evaluate", greedy.scores, learned.scores))
-            else:
-                raise ValueError(f"unknown parallel runtime command: {command}")
+        model.load_state_dict(payload["model_state_dict"])
+        if command == "collect":
+            _, result, metrics = collect_ppo_rollout(
+                model,
+                device,
+                storage.actions.shape[1],
+                rng,
+                gamma=payload["gamma"],
+                gae_lambda=payload["gae_lambda"],
+                logit_scale=payload["logit_scale"],
+                inference_batch_size=payload["inference_batch_size"],
+                storage=storage,
+            )
+            _clear_cuda_cache(device)
+            connection.send(("collect", result.scores, result.potentials, metrics))
+        elif command == "evaluate":
+            flavors = payload["flavors"]
+            ranks = payload["ranks"]
+            greedy = evaluate_policy(
+                None,
+                device,
+                flavors,
+                ranks,
+                inference_batch_size=payload["inference_batch_size"],
+            )
+            learned = evaluate_policy(
+                model.actor,
+                device,
+                flavors,
+                ranks,
+                inference_batch_size=payload["inference_batch_size"],
+            )
+            _clear_cuda_cache(device)
+            connection.send(("evaluate", greedy.scores, learned.scores))
+        else:
+            raise ValueError(f"unknown parallel runtime command: {command}")
     except BaseException:
         connection.send(("error", worker, traceback.format_exc()))
     finally:
@@ -167,7 +164,7 @@ def _worker_main(
 
 
 class ParallelAhc015Runtime:
-    """Persistent independent CPU/GPU pipelines for rollout and evaluation."""
+    """Independent CPU/GPU pipelines with a copy-free shared rollout buffer."""
 
     def __init__(
         self,
@@ -188,9 +185,17 @@ class ParallelAhc015Runtime:
         self.episodes = episodes
         self._context = mp.get_context("spawn")
         self._shared = _create_shared_rollout(self._context, workers, episodes // workers)
-        self._connections: list[Connection] = []
-        self._processes: list[mp.Process] = []
-        for worker in range(workers):
+        self._channels = channels
+        self._residual_blocks = residual_blocks
+        self._seeds = [seed + worker for worker in range(workers)]
+        self._closed = False
+
+    def _run_workers(self, command: str, payloads: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
+        if self._closed:
+            raise RuntimeError("parallel runtime is closed")
+        connections: list[Connection] = []
+        processes: list[mp.Process] = []
+        for worker, payload in enumerate(payloads):
             parent, child = self._context.Pipe()
             process = self._context.Process(
                 target=_worker_main,
@@ -198,20 +203,30 @@ class ParallelAhc015Runtime:
                     worker,
                     child,
                     self._shared,
-                    channels,
-                    residual_blocks,
-                    seed + worker,
+                    self._channels,
+                    self._residual_blocks,
+                    self._seeds[worker],
+                    command,
+                    payload,
                 ),
             )
             process.start()
             child.close()
-            self._connections.append(parent)
-            self._processes.append(process)
-        for connection in self._connections:
-            message = connection.recv()
-            self._raise_worker_error(message)
-            if message[0] != "ready":
-                raise RuntimeError(f"unexpected parallel runtime response: {message[0]}")
+            connections.append(parent)
+            processes.append(process)
+        try:
+            responses = [connection.recv() for connection in connections]
+            for response in responses:
+                self._raise_worker_error(response)
+            return responses
+        finally:
+            for process in processes:
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.terminate()
+                    process.join()
+            for connection in connections:
+                connection.close()
 
     @staticmethod
     def _cpu_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -239,11 +254,8 @@ class ParallelAhc015Runtime:
             "logit_scale": logit_scale,
             "inference_batch_size": inference_batch_size,
         }
-        for connection in self._connections:
-            connection.send(("collect", payload))
-        responses = [connection.recv() for connection in self._connections]
-        for response in responses:
-            self._raise_worker_error(response)
+        responses = self._run_workers("collect", [payload] * self.workers)
+        self._seeds = [seed + self.workers for seed in self._seeds]
         scores = np.concatenate([response[1] for response in responses])
         potentials = np.concatenate([response[2] for response in responses])
         metric_rows = [response[3] for response in responses]
@@ -273,43 +285,26 @@ class ParallelAhc015Runtime:
             raise ValueError("evaluation episodes must be divisible by parallel workers")
         state_dict = self._cpu_state_dict(model)
         shard = len(flavors) // self.workers
-        for worker, connection in enumerate(self._connections):
+        payloads = []
+        for worker in range(self.workers):
             start = worker * shard
             stop = start + shard
-            connection.send(
-                (
-                    "evaluate",
-                    {
-                        "model_state_dict": state_dict,
-                        "flavors": flavors[start:stop],
-                        "ranks": ranks[start:stop],
-                        "inference_batch_size": inference_batch_size,
-                    },
-                )
+            payloads.append(
+                {
+                    "model_state_dict": state_dict,
+                    "flavors": flavors[start:stop],
+                    "ranks": ranks[start:stop],
+                    "inference_batch_size": inference_batch_size,
+                }
             )
-        responses = [connection.recv() for connection in self._connections]
-        for response in responses:
-            self._raise_worker_error(response)
+        responses = self._run_workers("evaluate", payloads)
         return (
             np.concatenate([response[1] for response in responses]),
             np.concatenate([response[2] for response in responses]),
         )
 
     def close(self) -> None:
-        for connection in self._connections:
-            try:
-                connection.send(("close", None))
-            except (BrokenPipeError, EOFError):
-                pass
-        for process in self._processes:
-            process.join(timeout=10)
-            if process.is_alive():
-                process.terminate()
-                process.join()
-        for connection in self._connections:
-            connection.close()
-        self._connections.clear()
-        self._processes.clear()
+        self._closed = True
 
     def __enter__(self) -> ParallelAhc015Runtime:
         return self
