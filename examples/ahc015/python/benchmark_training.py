@@ -16,16 +16,15 @@ from .features import (
     FUTURE_CHANNELS,
     FUTURE_LENGTH,
     POTENTIAL_CHANNEL,
-    encode_afterstates,
+    encode_afterstates_with_potentials,
 )
 from .game import (
     ACTION_COUNT,
     CELL_COUNT,
     SIDE,
-    afterstates,
+    afterstates_batch,
     denominator,
-    place_at_rank,
-    potential,
+    place_at_ranks,
     tilt,
 )
 from .model import (
@@ -79,27 +78,20 @@ def benchmark_rollout_turn(
 
     synchronize(device)
     started = time.perf_counter()
-    for episode in range(episodes):
-        boards[episode] = place_at_rank(
-            boards[episode], int(ranks[episode]), int(flavors[episode, turn])
-        )
-    candidates = np.stack([afterstates(board) for board in boards])
-    board_features, future_features = encode_afterstates(
+    boards = place_at_ranks(boards, ranks, flavors[:, turn])
+    candidates = afterstates_batch(boards)
+    board_features, future_features, flat_potentials = encode_afterstates_with_potentials(
         candidates.reshape(episodes * ACTION_COUNT, SIDE, SIDE),
         np.tile(np.arange(ACTION_COUNT, dtype=np.uint8), episodes),
         np.full(episodes * ACTION_COUNT, turn + 1, dtype=np.uint8),
         np.repeat(flavors, ACTION_COUNT, axis=0),
+        np.repeat(score_denominators, ACTION_COUNT),
     )
     board_features = board_features.reshape(episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
     future_features = future_features.reshape(
         episodes, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH
     )
-    candidate_potentials = np.empty((episodes, ACTION_COUNT), dtype=np.float32)
-    for episode in range(episodes):
-        for action in range(ACTION_COUNT):
-            candidate_potentials[episode, action] = potential(
-                candidates[episode, action], score_denominators[episode]
-            )
+    candidate_potentials = flat_potentials.reshape(episodes, ACTION_COUNT)
     episode_batch_size = max(1, inference_batch_size // ACTION_COUNT)
     model.eval()
     with torch.inference_mode():
@@ -209,6 +201,7 @@ def main() -> None:
     parser.add_argument("--inference-batch-size", type=int, default=4096)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--micro-batch-size", type=int, default=128)
+    parser.add_argument("--data-parallel", action="store_true")
     parser.add_argument("--update-batches", type=int, default=4)
     parser.add_argument("--seed", type=int, default=15026)
     args = parser.parse_args()
@@ -225,16 +218,21 @@ def main() -> None:
     model = Ahc015PpoNet(channels, residual_blocks).to(device)
     if args.checkpoint is not None:
         load_checkpoint(args.checkpoint, model=model, map_location=device)
+    execution_model: torch.nn.Module = model
+    if args.data_parallel:
+        if device.type != "cuda" or torch.cuda.device_count() < 2:
+            raise RuntimeError("data parallel benchmark requires at least two CUDA devices")
+        execution_model = torch.nn.DataParallel(model)
 
     rollout_turn_seconds, storage = benchmark_rollout_turn(
-        model, device, args.episodes, args.inference_batch_size, rng
+        execution_model, device, args.episodes, args.inference_batch_size, rng
     )
     started = time.perf_counter()
     for array in storage:
         array.fill(0)
     buffer_write_seconds = time.perf_counter() - started
     update_seconds = benchmark_updates(
-        model,
+        execution_model,
         device,
         args.batch_size,
         args.micro_batch_size,
@@ -255,6 +253,7 @@ def main() -> None:
         "buffer_full_write_seconds": buffer_write_seconds,
         "measured_update_batches": args.update_batches,
         "micro_batch_size": args.micro_batch_size,
+        "data_parallel": args.data_parallel,
         "update_seconds": update_seconds,
         "estimated_updates": update_count,
         "estimated_optimization_seconds": estimated_optimization,

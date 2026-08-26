@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollout-episodes", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--micro-batch-size", type=int)
+    parser.add_argument(
+        "--data-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--evaluation-episodes", type=int)
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"))
@@ -134,6 +139,11 @@ def apply_overrides(config: Ahc015Config, args: argparse.Namespace) -> Ahc015Con
             args.micro_batch_size
             if args.micro_batch_size is not None
             else config.training.micro_batch_size
+        ),
+        data_parallel=(
+            args.data_parallel
+            if args.data_parallel is not None
+            else config.training.data_parallel
         ),
         epochs=args.epochs if args.epochs is not None else config.training.epochs,
     )
@@ -249,6 +259,15 @@ def main() -> None:
                 metrics=checkpoint_metrics,
             )
 
+    execution_model: torch.nn.Module = model
+    evaluation_model: torch.nn.Module = model.actor
+    if config.training.data_parallel:
+        if device.type != "cuda" or torch.cuda.device_count() < 2:
+            raise RuntimeError("data parallel training requires at least two CUDA devices")
+        execution_model = torch.nn.DataParallel(model)
+        evaluation_model = torch.nn.DataParallel(model.actor)
+        print(f"data parallel: {torch.cuda.device_count()} CUDA devices")
+
     last_metrics: dict[str, float] = {"training/update": float(update)}
     last_iteration = start_iteration - 1
     training_started = time.monotonic()
@@ -272,7 +291,7 @@ def main() -> None:
         iteration_started = time.monotonic()
         rollout_started = time.monotonic()
         rollout, _, rollout_metrics = collect_ppo_rollout(
-            model,
+            execution_model,
             device,
             config.training.rollout_episodes,
             rng,
@@ -289,7 +308,7 @@ def main() -> None:
         }
         optimization_started = time.monotonic()
         update_metrics = ppo_update(
-            model,
+            execution_model,
             optimizer,
             rollout,
             device,
@@ -318,7 +337,7 @@ def main() -> None:
 
         should_evaluate = (iteration + 1) % config.evaluation.interval == 0
         if should_evaluate:
-            metrics.update(evaluate(model.actor, device, config))
+            metrics.update(evaluate(evaluation_model, device, config))
             gain = metrics["evaluation/paired_gain"]
             if gain > best_gain:
                 best_gain = gain
@@ -361,7 +380,7 @@ def main() -> None:
 
     if "evaluation/paired_gain" not in last_metrics:
         print("running final paired evaluation", flush=True)
-        last_metrics.update(evaluate(model.actor, device, config))
+        last_metrics.update(evaluate(evaluation_model, device, config))
         gain = last_metrics["evaluation/paired_gain"]
         if gain > best_gain:
             best_gain = gain

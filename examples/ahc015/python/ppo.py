@@ -11,10 +11,17 @@ from .features import (
     FUTURE_CHANNELS,
     FUTURE_LENGTH,
     POTENTIAL_CHANNEL,
-    encode_afterstates,
+    encode_afterstates_with_potentials,
 )
-from .game import ACTION_COUNT, CELL_COUNT, SIDE, afterstates, denominator, place_at_rank, potential
-from .model import Ahc015PpoNet
+from .game import (
+    ACTION_COUNT,
+    CELL_COUNT,
+    SIDE,
+    afterstates_batch,
+    denominator,
+    place_at_ranks,
+    potential,
+)
 from .simulation import EvaluationResult
 
 
@@ -66,7 +73,7 @@ def _sample_actions(
 
 
 def collect_ppo_rollout(
-    model: Ahc015PpoNet,
+    model: torch.nn.Module,
     device: torch.device,
     episodes: int,
     rng: np.random.Generator,
@@ -100,32 +107,28 @@ def collect_ppo_rollout(
 
     model.eval()
     for turn in range(CELL_COUNT - 1):
-        for episode in range(episodes):
-            boards[episode] = place_at_rank(
-                boards[episode], int(ranks[episode, turn]), int(flavors[episode, turn])
-            )
+        boards = place_at_ranks(boards, ranks[:, turn], flavors[:, turn])
         state_potentials = np.asarray(
             [potential(boards[i], score_denominators[i]) for i in range(episodes)],
             dtype=np.float32,
         )
-        candidates = np.stack([afterstates(board) for board in boards])
+        candidates = afterstates_batch(boards)
         flat_candidates = candidates.reshape(episodes * ACTION_COUNT, SIDE, SIDE)
         actions_for_features = np.tile(np.arange(ACTION_COUNT, dtype=np.uint8), episodes)
         placed = np.full(episodes * ACTION_COUNT, turn + 1, dtype=np.uint8)
         repeated_flavors = np.repeat(flavors, ACTION_COUNT, axis=0)
-        board_features, future_features = encode_afterstates(
-            flat_candidates, actions_for_features, placed, repeated_flavors
+        board_features, future_features, flat_potentials = encode_afterstates_with_potentials(
+            flat_candidates,
+            actions_for_features,
+            placed,
+            repeated_flavors,
+            np.repeat(score_denominators, ACTION_COUNT),
         )
         board_features = board_features.reshape(episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
         future_features = future_features.reshape(
             episodes, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH
         )
-        candidate_potentials = np.empty((episodes, ACTION_COUNT), dtype=np.float32)
-        for episode in range(episodes):
-            for action in range(ACTION_COUNT):
-                candidate_potentials[episode, action] = potential(
-                    candidates[episode, action], score_denominators[episode]
-                )
+        candidate_potentials = flat_potentials.reshape(episodes, ACTION_COUNT)
         probabilities = np.empty((episodes, ACTION_COUNT), dtype=np.float32)
         values_array = np.empty(episodes, dtype=np.float32)
         episode_batch_size = max(1, inference_batch_size // ACTION_COUNT)
@@ -156,10 +159,7 @@ def collect_ppo_rollout(
         state_potential_steps.append(state_potentials)
         entropy_steps.append(float((-probabilities * np.log(probabilities + 1e-12)).sum(1).mean()))
 
-    for episode in range(episodes):
-        boards[episode] = place_at_rank(
-            boards[episode], int(ranks[episode, -1]), int(flavors[episode, -1])
-        )
+    boards = place_at_ranks(boards, ranks[:, -1], flavors[:, -1])
     final_potentials = np.asarray(
         [potential(boards[i], score_denominators[i]) for i in range(episodes)],
         dtype=np.float32,
@@ -205,7 +205,7 @@ def collect_ppo_rollout(
 
 
 def ppo_update(
-    model: Ahc015PpoNet,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     rollout: PpoRollout,
     device: torch.device,

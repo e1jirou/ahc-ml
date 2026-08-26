@@ -6,14 +6,14 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from .features import encode_afterstates
+from .features import encode_afterstates_with_potentials
 from .game import (
     ACTION_COUNT,
     CELL_COUNT,
     SIDE,
-    afterstates,
+    afterstates_batch,
     denominator,
-    place_at_rank,
+    place_at_ranks,
     potential,
 )
 
@@ -66,24 +66,37 @@ def evaluate_policy(
 ) -> EvaluationResult:
     episodes = len(flavors)
     boards = np.zeros((episodes, SIDE, SIDE), dtype=np.uint8)
+    score_denominators = np.asarray([denominator(row) for row in flavors])
     for turn in range(CELL_COUNT):
-        for episode in range(episodes):
-            boards[episode] = place_at_rank(
-                boards[episode], int(ranks[episode, turn]), int(flavors[episode, turn])
-            )
+        boards = place_at_ranks(boards, ranks[:, turn], flavors[:, turn])
         if turn + 1 == CELL_COUNT:
             break
-        candidates = np.stack([afterstates(board) for board in boards])
+        candidates = afterstates_batch(boards)
         flat = candidates.reshape(episodes * ACTION_COUNT, SIDE, SIDE)
         if model is None:
             residuals = np.zeros((episodes, ACTION_COUNT), dtype=np.float32)
+            candidate_potentials = np.asarray(
+                [
+                    potential(candidates[episode, action], score_denominators[episode])
+                    for episode in range(episodes)
+                    for action in range(ACTION_COUNT)
+                ],
+                dtype=np.float32,
+            ).reshape(episodes, ACTION_COUNT)
         else:
             actions = np.tile(np.arange(ACTION_COUNT, dtype=np.uint8), episodes)
             placed = np.full(episodes * ACTION_COUNT, turn + 1, dtype=np.uint8)
             repeated_flavors = np.repeat(flavors, ACTION_COUNT, axis=0)
-            board_features, future_features = encode_afterstates(
-                flat, actions, placed, repeated_flavors
+            board_features, future_features, flat_potentials = (
+                encode_afterstates_with_potentials(
+                    flat,
+                    actions,
+                    placed,
+                    repeated_flavors,
+                    np.repeat(score_denominators, ACTION_COUNT),
+                )
             )
+            candidate_potentials = flat_potentials.reshape(episodes, ACTION_COUNT)
             residuals = _predict_residuals(
                 model,
                 board_features,
@@ -91,16 +104,12 @@ def evaluate_policy(
                 device,
                 inference_batch_size,
             ).reshape(episodes, ACTION_COUNT)
-        values = residuals
-        for episode in range(episodes):
-            score_denominator = denominator(flavors[episode])
-            for action in range(ACTION_COUNT):
-                values[episode, action] += potential(candidates[episode, action], score_denominator)
+        values = residuals + candidate_potentials
         selected = np.argmax(values, axis=1)
         boards = candidates[np.arange(episodes), selected]
 
     potentials = np.asarray(
-        [potential(boards[index], denominator(flavors[index])) for index in range(episodes)],
+        [potential(boards[index], score_denominators[index]) for index in range(episodes)],
         dtype=np.float64,
     )
     scores = np.floor(1_000_000 * potentials + 0.5).astype(np.int64)
@@ -116,17 +125,15 @@ def evaluate_random_policy(
     rng = np.random.default_rng(seed)
     episodes = len(flavors)
     boards = np.zeros((episodes, SIDE, SIDE), dtype=np.uint8)
+    score_denominators = np.asarray([denominator(row) for row in flavors])
     for turn in range(CELL_COUNT):
-        for episode in range(episodes):
-            boards[episode] = place_at_rank(
-                boards[episode], int(ranks[episode, turn]), int(flavors[episode, turn])
-            )
+        boards = place_at_ranks(boards, ranks[:, turn], flavors[:, turn])
         if turn + 1 < CELL_COUNT:
             actions = rng.integers(0, ACTION_COUNT, size=episodes)
-            candidates = np.stack([afterstates(board) for board in boards])
+            candidates = afterstates_batch(boards)
             boards = candidates[np.arange(episodes), actions]
     potentials = np.asarray(
-        [potential(boards[index], denominator(flavors[index])) for index in range(episodes)],
+        [potential(boards[index], score_denominators[index]) for index in range(episodes)],
         dtype=np.float64,
     )
     scores = np.floor(1_000_000 * potentials + 0.5).astype(np.int64)

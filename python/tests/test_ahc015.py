@@ -14,6 +14,7 @@ from examples.ahc015.python.features import (
     POTENTIAL_CHANNEL,
     dynamic_flavor_mapping,
     encode_afterstates,
+    encode_afterstates_with_potentials,
     normalized_board,
 )
 from examples.ahc015.python.game import (
@@ -25,10 +26,15 @@ from examples.ahc015.python.game import (
     RIGHT,
     SIDE,
     afterstates,
+    afterstates_batch,
     connectivity_numerator,
+    denominator,
     empty_board,
     place_at_rank,
+    place_at_ranks,
+    potential,
     tilt,
+    tilt_batch,
 )
 from examples.ahc015.python.model import (
     STUDENT_CHANNELS,
@@ -58,6 +64,30 @@ def test_tilts_compact_without_reordering() -> None:
     assert np.array_equal(tilt(board, BACK)[-2:, 0], [1, 2])
     assert tilt(board, LEFT)[1, 0] == 3
     assert tilt(board, RIGHT)[1, -1] == 3
+
+
+def test_batched_placement_and_tilts_match_scalar_operations() -> None:
+    rng = np.random.default_rng(15028)
+    boards = np.zeros((8, SIDE, SIDE), dtype=np.uint8)
+    for episode in range(len(boards)):
+        cells = rng.choice(CELL_COUNT, size=40, replace=False)
+        boards[episode].reshape(-1)[cells] = rng.integers(1, 4, size=len(cells))
+    ranks = rng.integers(1, CELL_COUNT - 40 + 1, size=len(boards))
+    flavors = rng.integers(1, 4, size=len(boards))
+
+    expected_placements = np.stack(
+        [place_at_rank(board, int(rank), int(flavor)) for board, rank, flavor in zip(
+            boards, ranks, flavors, strict=True
+        )]
+    )
+    assert np.array_equal(place_at_ranks(boards, ranks, flavors), expected_placements)
+    for action in range(ACTION_COUNT):
+        expected_tilts = np.stack([tilt(board, action) for board in boards])
+        assert np.array_equal(tilt_batch(boards, action), expected_tilts)
+    assert np.array_equal(
+        afterstates_batch(boards),
+        np.stack([afterstates(board) for board in boards]),
+    )
 
 
 def test_rank_is_row_major_and_score_is_component_squared() -> None:
@@ -90,6 +120,22 @@ def test_dynamic_mapping_and_feature_shape() -> None:
     assert futures.dtype == np.float32
     assert np.count_nonzero(futures[:, :, 0]) == 0
     assert np.all(futures[:, :, 1:].sum(axis=1) == 1)
+
+    boards_with_potentials, futures_with_potentials, potentials = (
+        encode_afterstates_with_potentials(
+            candidates,
+            np.arange(ACTION_COUNT),
+            1,
+            flavors,
+        )
+    )
+    assert np.array_equal(boards_with_potentials, boards)
+    assert np.array_equal(futures_with_potentials, futures)
+    expected_potentials = np.asarray(
+        [potential(candidate, denominator(flavors)) for candidate in candidates],
+        dtype=np.float32,
+    )
+    assert np.array_equal(potentials, expected_potentials)
 
 
 def test_reflection_canonicalization() -> None:

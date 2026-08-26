@@ -28,6 +28,7 @@ class TrainingConfig:
     max_hours: float
     inference_batch_size: int
     micro_batch_size: int = 128
+    data_parallel: bool = False
 
 
 @dataclass(frozen=True)
