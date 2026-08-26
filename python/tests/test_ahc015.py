@@ -160,6 +160,7 @@ def test_config_and_ppo_model_shapes() -> None:
     assert config.model.residual_blocks == TEACHER_RESIDUAL_BLOCKS
     assert config.training.rollout_episodes == 4096
     assert config.training.batch_size == 1024
+    assert config.training.micro_batch_size == 128
     assert config.training.learning_rate == 3e-4
     assert config.ppo.gamma == 1.0
     fine_tune_config = load_config(config_directory / "config_finetune.toml")
@@ -307,6 +308,7 @@ def test_ppo_rollout_and_update_smoke() -> None:
         rng,
         epochs=1,
         batch_size=len(update_rollout),
+        micro_batch_size=2,
         clip_ratio=0.2,
         value_clip=0.2,
         value_coefficient=0.5,

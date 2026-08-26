@@ -27,6 +27,7 @@ class TrainingConfig:
     checkpoint_interval: int
     max_hours: float
     inference_batch_size: int
+    micro_batch_size: int = 128
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,7 @@ def load_config(path: str | Path) -> Ahc015Config:
         ("training.rollout_episodes", config.training.rollout_episodes),
         ("training.epochs", config.training.epochs),
         ("training.batch_size", config.training.batch_size),
+        ("training.micro_batch_size", config.training.micro_batch_size),
         ("training.learning_rate", config.training.learning_rate),
         ("training.gradient_clip_norm", config.training.gradient_clip_norm),
         ("training.checkpoint_interval", config.training.checkpoint_interval),
@@ -112,6 +114,8 @@ def load_config(path: str | Path) -> Ahc015Config:
         ("evaluation.episodes", config.evaluation.episodes),
     ):
         _positive(name, value)
+    if config.training.micro_batch_size > config.training.batch_size:
+        raise ValueError("training.micro_batch_size must not exceed training.batch_size")
     if config.ppo.gamma != 1.0:
         raise ValueError("ppo.gamma must be 1.0 so potential shaping preserves the objective")
     if not 0 < config.ppo.gae_lambda <= 1:

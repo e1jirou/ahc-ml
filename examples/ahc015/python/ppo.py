@@ -220,7 +220,12 @@ def ppo_update(
     gradient_clip_norm: float,
     logit_scale: float,
     target_kl: float,
+    micro_batch_size: int | None = None,
 ) -> dict[str, float]:
+    if micro_batch_size is None:
+        micro_batch_size = batch_size
+    if micro_batch_size <= 0 or micro_batch_size > batch_size:
+        raise ValueError("micro_batch_size must be in [1, batch_size]")
     advantages = rollout.advantages.copy()
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     losses: list[float] = []
@@ -238,51 +243,79 @@ def ppo_update(
         epoch_kls: list[float] = []
         for start in range(0, len(indices), batch_size):
             batch_indices = indices[start : start + batch_size]
-            potentials = torch.from_numpy(rollout.candidate_potentials[batch_indices]).to(device)
-            board_features = torch.from_numpy(rollout.board_features[batch_indices]).to(
-                device=device, dtype=torch.float32
-            )
-            board_features.div_(CELL_COUNT)
-            board_features[:, :, POTENTIAL_CHANNEL] = potentials[:, :, None, None]
-            future_features = torch.from_numpy(rollout.future_features[batch_indices]).to(
-                device=device, dtype=torch.float32
-            )
-            actions = torch.from_numpy(rollout.actions[batch_indices]).to(device)
-            old_log_probs = torch.from_numpy(rollout.old_log_probs[batch_indices]).to(device)
-            old_values = torch.from_numpy(rollout.old_values[batch_indices]).to(device)
-            batch_advantages = torch.from_numpy(advantages[batch_indices]).to(device)
-            returns = torch.from_numpy(rollout.returns[batch_indices]).to(device)
-
-            logits, values = model(board_features, future_features, potentials, logit_scale)
-            distribution = torch.distributions.Categorical(logits=logits)
-            log_probs = distribution.log_prob(actions)
-            log_ratio = log_probs - old_log_probs
-            ratio = log_ratio.exp()
-            unclipped = ratio * batch_advantages
-            clipped = ratio.clamp(1 - clip_ratio, 1 + clip_ratio) * batch_advantages
-            policy_loss = -torch.minimum(unclipped, clipped).mean()
-            clipped_values = old_values + (values - old_values).clamp(-value_clip, value_clip)
-            raw_value_loss = (values - returns).square()
-            clipped_value_loss = (clipped_values - returns).square()
-            value_loss = 0.5 * torch.maximum(raw_value_loss, clipped_value_loss).mean()
-            entropy = distribution.entropy().mean()
-            loss = policy_loss + value_coefficient * value_loss - entropy_coefficient * entropy
-
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            batch_metrics = {
+                name: torch.zeros((), device=device)
+                for name in (
+                    "loss",
+                    "policy_loss",
+                    "value_loss",
+                    "entropy",
+                    "kl",
+                    "clip_fraction",
+                )
+            }
+            for micro_start in range(0, len(batch_indices), micro_batch_size):
+                micro_indices = batch_indices[micro_start : micro_start + micro_batch_size]
+                weight = len(micro_indices) / len(batch_indices)
+                potentials = torch.from_numpy(
+                    rollout.candidate_potentials[micro_indices]
+                ).to(device)
+                board_features = torch.from_numpy(rollout.board_features[micro_indices]).to(
+                    device=device, dtype=torch.float32
+                )
+                board_features.div_(CELL_COUNT)
+                board_features[:, :, POTENTIAL_CHANNEL] = potentials[:, :, None, None]
+                future_features = torch.from_numpy(rollout.future_features[micro_indices]).to(
+                    device=device, dtype=torch.float32
+                )
+                actions = torch.from_numpy(rollout.actions[micro_indices]).to(device)
+                old_log_probs = torch.from_numpy(rollout.old_log_probs[micro_indices]).to(device)
+                old_values = torch.from_numpy(rollout.old_values[micro_indices]).to(device)
+                micro_advantages = torch.from_numpy(advantages[micro_indices]).to(device)
+                returns = torch.from_numpy(rollout.returns[micro_indices]).to(device)
+
+                logits, values = model(board_features, future_features, potentials, logit_scale)
+                distribution = torch.distributions.Categorical(logits=logits)
+                log_probs = distribution.log_prob(actions)
+                log_ratio = log_probs - old_log_probs
+                ratio = log_ratio.exp()
+                unclipped = ratio * micro_advantages
+                clipped = ratio.clamp(1 - clip_ratio, 1 + clip_ratio) * micro_advantages
+                policy_loss = -torch.minimum(unclipped, clipped).mean()
+                clipped_values = old_values + (values - old_values).clamp(
+                    -value_clip, value_clip
+                )
+                raw_value_loss = (values - returns).square()
+                clipped_value_loss = (clipped_values - returns).square()
+                value_loss = 0.5 * torch.maximum(raw_value_loss, clipped_value_loss).mean()
+                entropy = distribution.entropy().mean()
+                loss = policy_loss + value_coefficient * value_loss - entropy_coefficient * entropy
+                (loss * weight).backward()
+
+                with torch.no_grad():
+                    approximate_kl = ((ratio - 1) - log_ratio).mean()
+                    clip_fraction = ((ratio - 1).abs() > clip_ratio).float().mean()
+                for name, value in (
+                    ("loss", loss),
+                    ("policy_loss", policy_loss),
+                    ("value_loss", value_loss),
+                    ("entropy", entropy),
+                    ("kl", approximate_kl),
+                    ("clip_fraction", clip_fraction),
+                ):
+                    batch_metrics[name] += value.detach() * weight
+
             gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
             optimizer.step()
 
-            with torch.no_grad():
-                approximate_kl = ((ratio - 1) - log_ratio).mean()
-                clip_fraction = ((ratio - 1).abs() > clip_ratio).float().mean()
-            losses.append(float(loss.detach().cpu()))
-            policy_losses.append(float(policy_loss.detach().cpu()))
-            value_losses.append(float(value_loss.detach().cpu()))
-            entropies.append(float(entropy.detach().cpu()))
-            kls.append(float(approximate_kl.cpu()))
+            losses.append(float(batch_metrics["loss"].cpu()))
+            policy_losses.append(float(batch_metrics["policy_loss"].cpu()))
+            value_losses.append(float(batch_metrics["value_loss"].cpu()))
+            entropies.append(float(batch_metrics["entropy"].cpu()))
+            kls.append(float(batch_metrics["kl"].cpu()))
             epoch_kls.append(kls[-1])
-            clip_fractions.append(float(clip_fraction.cpu()))
+            clip_fractions.append(float(batch_metrics["clip_fraction"].cpu()))
             gradient_norms.append(float(gradient_norm.detach().cpu()))
             updates += 1
         if epoch_kls and np.mean(epoch_kls) > target_kl:

@@ -8,7 +8,8 @@ PPOで大型教師モデルを学習し、後で提出用の小型生徒モデ�
 ## 教師モデルの学習
 
 `config.toml`はゼロから教師を学習する標準設定である。rollout 4,096局、PPO 1 epoch、minibatch 1,024、
-AdamW learning rate `3e-4`を使用する。macOSでスリープを防ぎながら10時間学習するコマンドは次のとおり。
+AdamW learning rate `3e-4`を使用する。GPUメモリ上では128件ずつ処理して勾配を蓄積し、1,024件ごとに
+1回だけoptimizerを更新する。macOSでスリープを防ぎながら10時間学習するコマンドは次のとおり。
 
 ```bash
 caffeinate -i env PYTHONPATH=python .venv/bin/python \

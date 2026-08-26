@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-hours", type=float)
     parser.add_argument("--rollout-episodes", type=int)
     parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--micro-batch-size", type=int)
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--evaluation-episodes", type=int)
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"))
@@ -129,6 +130,11 @@ def apply_overrides(config: Ahc015Config, args: argparse.Namespace) -> Ahc015Con
             else config.training.rollout_episodes
         ),
         batch_size=(args.batch_size if args.batch_size is not None else config.training.batch_size),
+        micro_batch_size=(
+            args.micro_batch_size
+            if args.micro_batch_size is not None
+            else config.training.micro_batch_size
+        ),
         epochs=args.epochs if args.epochs is not None else config.training.epochs,
     )
     evaluation = replace(
@@ -151,6 +157,7 @@ def main() -> None:
         ("max_hours", config.training.max_hours),
         ("rollout_episodes", config.training.rollout_episodes),
         ("batch_size", config.training.batch_size),
+        ("micro_batch_size", config.training.micro_batch_size),
         ("epochs", config.training.epochs),
         ("evaluation_episodes", config.evaluation.episodes),
     ):
@@ -289,6 +296,7 @@ def main() -> None:
             rng,
             epochs=config.training.epochs,
             batch_size=config.training.batch_size,
+            micro_batch_size=config.training.micro_batch_size,
             clip_ratio=config.ppo.clip_ratio,
             value_clip=config.ppo.value_clip,
             value_coefficient=config.ppo.value_coefficient,
@@ -303,6 +311,7 @@ def main() -> None:
         metrics["training/update"] = float(update)
         metrics["training/environment_transitions"] = float(environment_transitions)
         metrics["training/learning_rate"] = config.training.learning_rate
+        metrics["training/micro_batch_size"] = float(config.training.micro_batch_size)
         metrics["training/early_stop_count"] = float(early_stop_count)
         metrics["training/early_stop_rate"] = early_stop_count / (iteration + 1)
         metrics["timing/optimization_seconds"] = time.monotonic() - optimization_started

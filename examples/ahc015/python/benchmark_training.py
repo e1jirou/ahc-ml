@@ -150,6 +150,7 @@ def benchmark_updates(
     model: Ahc015PpoNet,
     device: torch.device,
     batch_size: int,
+    micro_batch_size: int,
     batches: int,
     rng: np.random.Generator,
 ) -> float:
@@ -163,6 +164,7 @@ def benchmark_updates(
         rng,
         epochs=1,
         batch_size=batch_size,
+        micro_batch_size=micro_batch_size,
         clip_ratio=0.2,
         value_clip=0.2,
         value_coefficient=0.5,
@@ -182,6 +184,7 @@ def benchmark_updates(
         rng,
         epochs=1,
         batch_size=batch_size,
+        micro_batch_size=micro_batch_size,
         clip_ratio=0.2,
         value_clip=0.2,
         value_coefficient=0.5,
@@ -205,6 +208,7 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=4096)
     parser.add_argument("--inference-batch-size", type=int, default=4096)
     parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--micro-batch-size", type=int, default=128)
     parser.add_argument("--update-batches", type=int, default=4)
     parser.add_argument("--seed", type=int, default=15026)
     args = parser.parse_args()
@@ -229,7 +233,14 @@ def main() -> None:
     for array in storage:
         array.fill(0)
     buffer_write_seconds = time.perf_counter() - started
-    update_seconds = benchmark_updates(model, device, args.batch_size, args.update_batches, rng)
+    update_seconds = benchmark_updates(
+        model,
+        device,
+        args.batch_size,
+        args.micro_batch_size,
+        args.update_batches,
+        rng,
+    )
 
     transitions = args.episodes * (CELL_COUNT - 1)
     update_count = math.ceil(transitions / args.batch_size)
@@ -243,6 +254,7 @@ def main() -> None:
         "buffer_gib": sum(array.nbytes for array in storage) / (1024**3),
         "buffer_full_write_seconds": buffer_write_seconds,
         "measured_update_batches": args.update_batches,
+        "micro_batch_size": args.micro_batch_size,
         "update_seconds": update_seconds,
         "estimated_updates": update_count,
         "estimated_optimization_seconds": estimated_optimization,

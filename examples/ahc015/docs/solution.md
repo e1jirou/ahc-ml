@@ -102,6 +102,7 @@ L = L_policy + value_coefficient * L_value - entropy_coefficient * entropy
 | transitions / iteration | 405,504 |
 | PPO epochs | 1 |
 | minibatch size | 1,024 |
+| GPU microbatch size | 128（8回の勾配蓄積でminibatch 1,024を維持） |
 | AdamW learning rate | `3e-4` |
 | weight decay | `1e-4` |
 | policy clip | `0.2` |
