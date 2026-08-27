@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rollout-processes", type=int, choices=(1, 2))
     parser.add_argument("--epochs", type=int)
+    parser.add_argument("--evaluation-interval", type=int)
     parser.add_argument("--evaluation-episodes", type=int)
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"))
     parser.add_argument("--experiment-log", type=Path)
@@ -167,6 +168,11 @@ def apply_overrides(config: Ahc015Config, args: argparse.Namespace) -> Ahc015Con
     )
     evaluation = replace(
         config.evaluation,
+        interval=(
+            args.evaluation_interval
+            if args.evaluation_interval is not None
+            else config.evaluation.interval
+        ),
         episodes=(
             args.evaluation_episodes
             if args.evaluation_episodes is not None
@@ -188,6 +194,7 @@ def main() -> None:
         ("micro_batch_size", config.training.micro_batch_size),
         ("rollout_processes", config.training.rollout_processes),
         ("epochs", config.training.epochs),
+        ("evaluation_interval", config.evaluation.interval),
         ("evaluation_episodes", config.evaluation.episodes),
     ):
         if value <= 0:
