@@ -1,12 +1,12 @@
 [run]
 seed = 15027
-device = "auto"
+device = "mps"
 deterministic = false
 output_dir = "outputs/ahc015"
 experiment_log = "examples/ahc015/docs/experiments.md"
 
 [model]
-channels = 256
+channels = 64
 residual_blocks = 10
 
 [training]

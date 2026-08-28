@@ -934,3 +934,72 @@
 - elapsed: 12.718 hours
 - updates: 1188
 - best paired gain: 150311.695
+
+## small-20260827-232147
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260827-232147`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15027
+- wall-clock limit: 10.000 hours
+- W&B: disabled, run ID `mj8m2zdn`
+- status: aborted during setup before the first iteration; W&Bを無効化していたためonline設定へ直して再実行した
+
+## small-20260827-232351
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260827-232351`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15027
+- wall-clock limit: 10.000 hours
+- W&B: online, run ID `hohp3ev1`
+- status: time limit reached
+- elapsed: 10.004 hours
+- updates: 67320
+- best paired gain: 392249.254
+- 目的: afterstate 4入力・12盤面特徴・未来列FiLM・256 channelの構成が過剰かを調べるため、傾斜前盤面を
+  1ターン1入力とし、canonical味3面と空きマス1面だけを使う64 channel・10 blockモデルを学習した。
+  actorは4方向の残差を同時出力し、解析的な`Phi`は特徴量ではなくlogitのbaselineとしてのみ加えた
+- モデル規模: actor 50,628 parameter。従来teacher 986,113 parameterの約5.1%。rollout feature bufferは
+  0.151 GiBで、従来の圧縮buffer 2.72 GiBから約94.4%減少した
+- 完走確認: iteration 0から169まで170 iteration、68,935,680 transition、67,320 optimizer update。
+  全iterationが4,096局・1 epoch・396 updateを完遂し、early stopは初期の1回だけだった
+- 固定512ケース: bestはiteration 161の平均740,662、greedy比+392,249、勝率100%。最終iteration 169は
+  平均732,747で、best選択が必要な程度の評価変動は残った
+- 終盤の更新指標: 最後5 iterationの平均KL 0.00535、clip fraction 4.89%、rollout entropy 0.2191、
+  explained variance 0.9774。学習は安定しており、entropyは初期1.38から低下した
+- 速度: 全iteration平均でrollout 126.673秒、最適化63.193秒、evaluation 21.907秒、合計211.800秒
+  （3.53分）。従来teacherの約25分/iterationより大幅に高速化した
+
+## small-20260828-093536
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260828-093536`
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15028
+- wall-clock limit: 5.000 hours
+- W&B: online, run ID `lwi47t81`
+- status: time limit reached
+- elapsed: 5.054 hours
+- updates: 97020
+- best paired gain: 401973.766
+- 継続条件: 10時間runの`best-training.pt`（iteration 161）から再開し、rolloutの重複を避けるためseedを
+  `15028`へ変更。learning rate `3e-4`など他の条件は維持した
+- 完走確認: iteration 162から244まで83 iteration、33,656,832 transitionと32,868 optimizer updateを
+  追加した。継続前を含む累計は99,348,480 transition、97,020 update
+- 固定512ケース: 最初5回平均736,309に対し最後5回平均744,315で+8,006点。bestは最終iteration 244の
+  平均750,387、greedy比+401,974、勝率99.80%で、継続元bestを+9,725点更新した
+- 更新指標: 平均KL 0.00539、clip fraction 4.88%、explained variance 0.9783。rollout entropyは最初5回の
+  0.2068から最後5回の0.1804へ低下したが、性能改善は継続していた
+- 速度: rollout平均125.842秒、最適化平均71.404秒、evaluation平均21.865秒、iteration平均219.117秒
+  （3.65分）
+- 独立評価: 2,000件、seed `20260828`（学習・best選択には未使用）。10時間bestの平均736,034.997に対し
+  継続bestは748,286.815。同一ケース差は+12,251.818 ±2,618.700、継続bestの勝率53.35%、同率0.30%。
+  改善は約4.7標準誤差で明確
+- 判断: 従来teacherの約5.1%のparameterと4種類の素朴な特徴だけでも高い性能に到達し、15時間時点でも
+  改善が続いた。一方、従来teacherの固定評価best 798,724とは約48,000点の差があり、容量・afterstate表現・
+  未来列・派生特徴のどれが差を生むかは本実験単独では分離できない。単純モデルを有力baselineとして残し、
+  次は変更を1要素ずつ戻すablationで寄与を測る

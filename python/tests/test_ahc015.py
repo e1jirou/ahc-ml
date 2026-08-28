@@ -3,18 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pytest
 import torch
 
 from examples.ahc015.python.config import load_config
 from examples.ahc015.python.features import (
     BOARD_CHANNELS,
-    FUTURE_CHANNELS,
-    FUTURE_LENGTH,
-    POTENTIAL_CHANNEL,
     dynamic_flavor_mapping,
-    encode_afterstates,
-    encode_afterstates_with_potentials,
+    encode_states,
     normalized_board,
 )
 from examples.ahc015.python.game import (
@@ -28,11 +23,9 @@ from examples.ahc015.python.game import (
     afterstates,
     afterstates_batch,
     connectivity_numerator,
-    denominator,
     empty_board,
     place_at_rank,
     place_at_ranks,
-    potential,
     tilt,
     tilt_batch,
 )
@@ -40,7 +33,6 @@ from examples.ahc015.python.model import (
     STUDENT_CHANNELS,
     STUDENT_PARAMETER_COUNT,
     STUDENT_RESIDUAL_BLOCKS,
-    TEACHER_CHANNELS,
     TEACHER_PARAMETER_COUNT,
     TEACHER_RESIDUAL_BLOCKS,
     Ahc015PpoNet,
@@ -54,6 +46,7 @@ from examples.ahc015.python.ppo import (
     generalized_advantages,
     ppo_update,
 )
+from examples.ahc015.python.simulation import evaluate_policy, generate_cases
 
 
 def test_tilts_compact_without_reordering() -> None:
@@ -114,30 +107,12 @@ def test_dynamic_mapping_and_feature_shape() -> None:
 
     board = empty_board()
     board[4, 4] = flavors[0]
-    candidates = afterstates(board)
-    boards, futures = encode_afterstates(candidates, np.arange(ACTION_COUNT), 1, flavors)
-    assert boards.shape == (ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
-    assert futures.shape == (ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH)
-    assert boards.dtype == np.float32
-    assert futures.dtype == np.float32
-    assert np.count_nonzero(futures[:, :, 0]) == 0
-    assert np.all(futures[:, :, 1:].sum(axis=1) == 1)
-
-    boards_with_potentials, futures_with_potentials, potentials = (
-        encode_afterstates_with_potentials(
-            candidates,
-            np.arange(ACTION_COUNT),
-            1,
-            flavors,
-        )
-    )
-    assert np.array_equal(boards_with_potentials, boards)
-    assert np.array_equal(futures_with_potentials, futures)
-    expected_potentials = np.asarray(
-        [potential(candidate, denominator(flavors)) for candidate in candidates],
-        dtype=np.float32,
-    )
-    assert np.array_equal(potentials, expected_potentials)
+    features, action_permutations = encode_states([board], 1, flavors)
+    assert features.shape == (1, BOARD_CHANNELS, SIDE, SIDE)
+    assert features.dtype == np.float32
+    assert action_permutations.shape == (1, ACTION_COUNT)
+    assert sorted(action_permutations[0].tolist()) == list(range(ACTION_COUNT))
+    assert np.all(features.sum(axis=1) == 1)
 
 
 def test_reflection_canonicalization() -> None:
@@ -145,23 +120,29 @@ def test_reflection_canonicalization() -> None:
     board = empty_board()
     board[0, 8] = 1
     board[1, 7] = 2
-    assert np.array_equal(
-        normalized_board(board, FRONT, flavors, 3),
-        normalized_board(board[:, ::-1], FRONT, flavors, 3),
-    )
+    normalized, _ = normalized_board(board, flavors, 3)
+    mirrored, _ = normalized_board(board[:, ::-1], flavors, 3)
+    assert np.array_equal(normalized, mirrored)
 
 
-def test_action_rotation_matches_front_orientation() -> None:
+def test_board_rotation_preserves_action_semantics() -> None:
     flavors = np.resize(np.array([1, 2, 3], dtype=np.uint8), CELL_COUNT)
     board = empty_board()
     board[2, 5] = 1
     board[7, 5] = 2
-    candidates = afterstates(board)
-    canonical = [
-        normalized_board(candidates[action], action, flavors, 2)
-        for action in (FRONT, BACK, LEFT, RIGHT)
-    ]
-    assert all(candidate.shape == (SIDE, SIDE) for candidate in canonical)
+    normalized, normalized_to_original = normalized_board(board, flavors, 2)
+    rotated, rotated_to_original = normalized_board(np.rot90(board), flavors, 2)
+    assert np.array_equal(normalized, rotated)
+    original_candidates = afterstates(board)
+    rotated_candidates = afterstates(np.rot90(board))
+    for normalized_action in range(ACTION_COUNT):
+        left, _ = normalized_board(
+            original_candidates[normalized_to_original[normalized_action]], flavors, 2
+        )
+        right, _ = normalized_board(
+            rotated_candidates[rotated_to_original[normalized_action]], flavors, 2
+        )
+        assert np.array_equal(left, right)
 
 
 def test_model_shape_parameter_count_and_zero_residual() -> None:
@@ -169,42 +150,37 @@ def test_model_shape_parameter_count_and_zero_residual() -> None:
     model = Ahc015ValueNet().eval()
     assert parameter_count(model) == STUDENT_PARAMETER_COUNT
     board_inputs = torch.randn(2, BOARD_CHANNELS, SIDE, SIDE)
-    future_inputs = torch.randn(2, FUTURE_CHANNELS, FUTURE_LENGTH)
     with torch.inference_mode():
-        outputs = model(board_inputs, future_inputs)
-    assert outputs.shape == (2,)
-    assert torch.equal(outputs, torch.zeros(2))
+        outputs = model(board_inputs)
+    assert outputs.shape == (2, ACTION_COUNT)
+    assert torch.equal(outputs, torch.zeros(2, ACTION_COUNT))
 
 
-def test_future_information_merges_only_through_film() -> None:
+def test_model_is_board_only() -> None:
     torch.manual_seed(1)
     model = Ahc015ValueNet().eval()
     torch.nn.init.normal_(model.output.weight)
     board_inputs = torch.randn(2, BOARD_CHANNELS, SIDE, SIDE)
-    future_inputs = torch.randn(2, FUTURE_CHANNELS, FUTURE_LENGTH)
     with torch.inference_mode():
-        actual = model(board_inputs, future_inputs)
-        future = torch.relu(model.future_fc1(future_inputs.flatten(start_dim=1)))
-        future = torch.relu(model.future_fc2(future))
-        gamma, beta = model.film(future).chunk(2, dim=1)
+        actual = model(board_inputs)
         board = torch.relu(model.board_stem(board_inputs))
-        board = board * (1 + gamma[:, :, None, None]) + beta[:, :, None, None]
         for block in model.blocks:
             board = block(board)
         board = board.mean(dim=(2, 3))
-        expected = model.output(board).squeeze(1)
+        expected = model.output(board)
     assert torch.equal(actual, expected)
 
 
 def test_teacher_is_about_four_times_the_student() -> None:
-    assert TEACHER_PARAMETER_COUNT / STUDENT_PARAMETER_COUNT == pytest.approx(4.0, rel=0.1)
+    assert TEACHER_PARAMETER_COUNT == STUDENT_PARAMETER_COUNT
 
 
 def test_config_and_ppo_model_shapes() -> None:
     config_directory = Path(__file__).parents[2] / "examples" / "ahc015"
     config = load_config(config_directory / "config.toml")
     assert config.training.max_hours == 10.0
-    assert config.model.channels == TEACHER_CHANNELS
+    assert config.run.device == "mps"
+    assert config.model.channels == 64
     assert config.model.residual_blocks == TEACHER_RESIDUAL_BLOCKS
     assert config.training.rollout_episodes == 4096
     assert config.training.batch_size == 1024
@@ -263,15 +239,24 @@ def test_config_and_ppo_model_shapes() -> None:
     assert rollout4096_config.evaluation.interval == 1
 
     model = Ahc015PpoNet(STUDENT_CHANNELS, STUDENT_RESIDUAL_BLOCKS).eval()
-    boards = torch.randn(2, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
-    futures = torch.randn(2, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH)
+    boards = torch.randn(2, BOARD_CHANNELS, SIDE, SIDE)
     potentials = torch.rand(2, ACTION_COUNT)
     with torch.inference_mode():
-        logits, values = model(boards, futures, potentials, config.ppo.logit_scale)
+        logits, values = model(boards, potentials, config.ppo.logit_scale)
     assert logits.shape == (2, ACTION_COUNT)
     assert values.shape == (2,)
     assert torch.allclose(logits, config.ppo.logit_scale * potentials)
     assert torch.equal(values, torch.zeros(2))
+
+
+def test_zero_actor_is_exact_phi_greedy_after_normalization() -> None:
+    flavors, ranks = generate_cases(4, 15029)
+    device = torch.device("cpu")
+    expected = evaluate_policy(None, device, flavors, ranks, inference_batch_size=4)
+    actual = evaluate_policy(
+        Ahc015ValueNet().eval(), device, flavors, ranks, inference_batch_size=4
+    )
+    assert np.array_equal(actual.scores, expected.scores)
 
 
 def test_generalized_advantages_terminal_and_shape() -> None:
@@ -301,20 +286,12 @@ def test_ppo_rollout_and_update_smoke() -> None:
     assert len(rollout) == 2 * 99
     assert rollout.board_features.shape == (
         2 * 99,
-        ACTION_COUNT,
         BOARD_CHANNELS,
         SIDE,
         SIDE,
     )
-    assert rollout.future_features.shape == (
-        2 * 99,
-        ACTION_COUNT,
-        FUTURE_CHANNELS,
-        FUTURE_LENGTH,
-    )
     assert rollout.board_features.dtype == np.uint8
-    assert rollout.future_features.dtype == np.uint8
-    assert np.count_nonzero(rollout.board_features[:, :, POTENTIAL_CHANNEL]) == 0
+    assert np.all(rollout.board_features.sum(axis=1) == 1)
     assert np.all(np.isfinite(rollout.advantages))
     assert np.all((result.potentials >= 0) & (result.potentials <= 1))
     assert metrics["rollout/mean_score"] > 0
@@ -336,15 +313,10 @@ def test_ppo_rollout_and_update_smoke() -> None:
     assert np.array_equal(stored_result.scores, result.scores)
     assert stored_metrics == metrics
 
-    restored_boards = torch.from_numpy(rollout.board_features[:8]).float() / CELL_COUNT
-    restored_boards[:, :, POTENTIAL_CHANNEL] = torch.from_numpy(rollout.candidate_potentials[:8])[
-        :, :, None, None
-    ]
-    restored_futures = torch.from_numpy(rollout.future_features[:8]).float()
+    restored_boards = torch.from_numpy(rollout.board_features[:8]).float()
     with torch.inference_mode():
         logits, old_values = model(
             restored_boards,
-            restored_futures,
             torch.from_numpy(rollout.candidate_potentials[:8]),
             12.0,
         )
@@ -356,7 +328,6 @@ def test_ppo_rollout_and_update_smoke() -> None:
 
     update_rollout = PpoRollout(
         board_features=rollout.board_features[:4],
-        future_features=rollout.future_features[:4],
         candidate_potentials=rollout.candidate_potentials[:4],
         actions=rollout.actions[:4],
         old_log_probs=rollout.old_log_probs[:4],

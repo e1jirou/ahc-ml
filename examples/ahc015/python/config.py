@@ -87,7 +87,7 @@ def load_config(path: str | Path) -> Ahc015Config:
         values = tomllib.load(file)
     config = Ahc015Config(
         run=RunConfig(**values["run"]),
-        model=ModelConfig(**values.get("model", {"channels": 128, "residual_blocks": 8})),
+        model=ModelConfig(**values.get("model", {"channels": 64, "residual_blocks": 10})),
         training=TrainingConfig(**values["training"]),
         ppo=PpoConfig(**values["ppo"]),
         evaluation=EvaluationConfig(**values["evaluation"]),

@@ -13,15 +13,14 @@ import numpy as np
 import torch
 from ahc_ml.checkpoint import load_checkpoint, save_checkpoint
 from ahc_ml.device import select_device
-from ahc_ml.export import export_quantized_state_dict, export_state_dict
 from ahc_ml.seed import seed_everything
 from ahc_ml.tracking import WandbTracker
 from ahc_ml.visualization import render_model_graph
 
 from .config import Ahc015Config, load_config
-from .features import BOARD_CHANNELS, FUTURE_CHANNELS, FUTURE_LENGTH
+from .features import BOARD_CHANNELS
 from .game import SIDE
-from .model import STUDENT_CHANNELS, STUDENT_RESIDUAL_BLOCKS, Ahc015PpoNet, parameter_count
+from .model import Ahc015PpoNet, parameter_count
 from .parallel_runtime import ParallelAhc015Runtime
 from .ppo import collect_ppo_rollout, ppo_update
 from .simulation import evaluate_policy, generate_cases
@@ -97,30 +96,6 @@ def evaluate(
         "evaluation/paired_gain_se": float(difference.std(ddof=1) / math.sqrt(len(difference))),
         "evaluation/win_rate": float(np.mean(difference > 0)),
     }
-
-
-def export_actor(
-    model: torch.nn.Module,
-    output_dir: Path,
-    *,
-    channels: int,
-    residual_blocks: int,
-) -> None:
-    parameters = parameter_count(model)
-    metadata = {
-        "architecture": f"ahc015-ppo-actor-{channels}x{residual_blocks}-film-v3",
-        "training_algorithm": "ppo",
-        "channels": channels,
-        "residual_blocks": residual_blocks,
-        "parameter_count": parameters,
-    }
-    export_state_dict(model.state_dict(), output_dir / "model.bin", metadata=metadata)
-    export_quantized_state_dict(
-        model.state_dict(),
-        output_dir / "model.q8.bin",
-        metadata=metadata,
-        rust_source=output_dir / "model_data.rs",
-    )
 
 
 def load_training_checkpoint(
@@ -203,7 +178,7 @@ def main() -> None:
     rng = np.random.default_rng(config.run.seed)
     device, device_info = select_device(config.run.device)
 
-    run_name = datetime.now().strftime("ppo-%Y%m%d-%H%M%S")
+    run_name = datetime.now().strftime("small-%Y%m%d-%H%M%S")
     output_root = args.output_dir or Path(config.run.output_dir)
     output_dir = output_root / run_name
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -232,10 +207,7 @@ def main() -> None:
     )
     graph_svg, graph_png = render_model_graph(
         model.actor,
-        input_size=[
-            (1, BOARD_CHANNELS, SIDE, SIDE),
-            (1, FUTURE_CHANNELS, FUTURE_LENGTH),
-        ],
+        input_size=(1, BOARD_CHANNELS, SIDE, SIDE),
         output_stem=output_dir / "model-graph",
     )
     tracker.log_image(
@@ -518,24 +490,6 @@ def main() -> None:
         name=f"{run_name}-training-checkpoint",
         artifact_type="model",
     )
-    if (
-        config.model.channels == STUDENT_CHANNELS
-        and config.model.residual_blocks == STUDENT_RESIDUAL_BLOCKS
-    ):
-        export_actor(
-            model.actor,
-            output_dir,
-            channels=config.model.channels,
-            residual_blocks=config.model.residual_blocks,
-        )
-        tracker.log_artifact(
-            output_dir / "model.bin", name=f"{run_name}-rust-weights", artifact_type="model"
-        )
-        tracker.log_artifact(
-            output_dir / "model.q8.bin",
-            name=f"{run_name}-rust-weights-q8",
-            artifact_type="model",
-        )
     tracker.finish()
     append_experiment_log(
         log_path,

@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from .features import encode_afterstates_with_potentials
+from .features import encode_states
 from .game import (
     ACTION_COUNT,
     CELL_COUNT,
@@ -39,20 +39,18 @@ def generate_cases(
 def _predict_residuals(
     model: torch.nn.Module | None,
     board_features: NDArray[np.float32],
-    future_features: NDArray[np.float32],
     device: torch.device,
     inference_batch_size: int,
 ) -> NDArray[np.float32]:
     if model is None:
-        return np.zeros(len(board_features), dtype=np.float32)
+        return np.zeros((len(board_features), ACTION_COUNT), dtype=np.float32)
     predictions = []
     model.eval()
     with torch.inference_mode():
         for start in range(0, len(board_features), inference_batch_size):
             stop = start + inference_batch_size
             boards = torch.from_numpy(board_features[start:stop]).to(device)
-            futures = torch.from_numpy(future_features[start:stop]).to(device)
-            predictions.append(model(boards, futures).cpu().numpy())
+            predictions.append(model(boards).cpu().numpy())
     return np.concatenate(predictions).astype(np.float32, copy=False)
 
 
@@ -72,7 +70,6 @@ def evaluate_policy(
         if turn + 1 == CELL_COUNT:
             break
         candidates = afterstates_batch(boards)
-        flat = candidates.reshape(episodes * ACTION_COUNT, SIDE, SIDE)
         if model is None:
             residuals = np.zeros((episodes, ACTION_COUNT), dtype=np.float32)
             candidate_potentials = np.asarray(
@@ -84,29 +81,35 @@ def evaluate_policy(
                 dtype=np.float32,
             ).reshape(episodes, ACTION_COUNT)
         else:
-            actions = np.tile(np.arange(ACTION_COUNT, dtype=np.uint8), episodes)
-            placed = np.full(episodes * ACTION_COUNT, turn + 1, dtype=np.uint8)
-            repeated_flavors = np.repeat(flavors, ACTION_COUNT, axis=0)
-            board_features, future_features, flat_potentials = (
-                encode_afterstates_with_potentials(
-                    flat,
-                    actions,
-                    placed,
-                    repeated_flavors,
-                    np.repeat(score_denominators, ACTION_COUNT),
-                )
+            board_features, normalized_to_original = encode_states(boards, turn + 1, flavors)
+            original_potentials = np.asarray(
+                [
+                    [
+                        potential(candidates[episode, action], score_denominators[episode])
+                        for action in range(ACTION_COUNT)
+                    ]
+                    for episode in range(episodes)
+                ],
+                dtype=np.float32,
             )
-            candidate_potentials = flat_potentials.reshape(episodes, ACTION_COUNT)
-            residuals = _predict_residuals(
+            normalized_residuals = _predict_residuals(
                 model,
                 board_features,
-                future_features,
                 device,
                 inference_batch_size,
-            ).reshape(episodes, ACTION_COUNT)
+            )
+            original_residuals = np.empty_like(normalized_residuals)
+            np.put_along_axis(
+                original_residuals,
+                normalized_to_original,
+                normalized_residuals,
+                axis=1,
+            )
+            selected = np.argmax(original_residuals + original_potentials, axis=1)
+            boards = candidates[np.arange(episodes), selected]
+            continue
         values = residuals + candidate_potentials
-        selected = np.argmax(values, axis=1)
-        boards = candidates[np.arange(episodes), selected]
+        boards = candidates[np.arange(episodes), np.argmax(values, axis=1)]
 
     potentials = np.asarray(
         [potential(boards[index], score_denominators[index]) for index in range(episodes)],

@@ -16,10 +16,7 @@ from ahc_ml.device import select_device
 
 from .features import (
     BOARD_CHANNELS,
-    FUTURE_CHANNELS,
-    FUTURE_LENGTH,
-    POTENTIAL_CHANNEL,
-    encode_afterstates_with_potentials,
+    encode_states,
 )
 from .game import (
     ACTION_COUNT,
@@ -28,6 +25,7 @@ from .game import (
     afterstates_batch,
     denominator,
     place_at_ranks,
+    potential,
     tilt,
 )
 from .model import (
@@ -66,16 +64,12 @@ def benchmark_rollout_turn(
     episodes: int,
     inference_batch_size: int,
     rng: np.random.Generator,
-) -> tuple[float, tuple[np.ndarray, np.ndarray]]:
+) -> tuple[float, tuple[np.ndarray, ...]]:
     turn = CELL_COUNT // 2
     boards, flavors, ranks = representative_boards(episodes, rng)
     score_denominators = np.asarray([denominator(row) for row in flavors])
     board_storage = np.empty(
-        (CELL_COUNT - 1, episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE),
-        dtype=np.uint8,
-    )
-    future_storage = np.empty(
-        (CELL_COUNT - 1, episodes, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH),
+        (CELL_COUNT - 1, episodes, BOARD_CHANNELS, SIDE, SIDE),
         dtype=np.uint8,
     )
 
@@ -83,35 +77,29 @@ def benchmark_rollout_turn(
     started = time.perf_counter()
     boards = place_at_ranks(boards, ranks, flavors[:, turn])
     candidates = afterstates_batch(boards)
-    board_features, future_features, flat_potentials = encode_afterstates_with_potentials(
-        candidates.reshape(episodes * ACTION_COUNT, SIDE, SIDE),
-        np.tile(np.arange(ACTION_COUNT, dtype=np.uint8), episodes),
-        np.full(episodes * ACTION_COUNT, turn + 1, dtype=np.uint8),
-        np.repeat(flavors, ACTION_COUNT, axis=0),
-        np.repeat(score_denominators, ACTION_COUNT),
+    board_features, normalized_to_original = encode_states(boards, turn + 1, flavors)
+    original_potentials = np.asarray(
+        [
+            [potential(candidate, int(denominator_value)) for candidate in episode_candidates]
+            for episode_candidates, denominator_value in zip(
+                candidates, score_denominators, strict=True
+            )
+        ],
+        dtype=np.float32,
     )
-    board_features = board_features.reshape(episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
-    future_features = future_features.reshape(
-        episodes, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH
-    )
-    candidate_potentials = flat_potentials.reshape(episodes, ACTION_COUNT)
-    episode_batch_size = max(1, inference_batch_size // ACTION_COUNT)
+    candidate_potentials = np.take_along_axis(original_potentials, normalized_to_original, axis=1)
+    episode_batch_size = inference_batch_size
     model.eval()
     with torch.inference_mode():
         for start in range(0, episodes, episode_batch_size):
             stop = min(start + episode_batch_size, episodes)
             boards_input = torch.from_numpy(board_features[start:stop]).to(device)
-            futures_input = torch.from_numpy(future_features[start:stop]).to(device)
             potentials = torch.from_numpy(candidate_potentials[start:stop]).to(device)
-            logits, values = model(boards_input, futures_input, potentials, 12.0)
+            logits, values = model(boards_input, potentials, 12.0)
             _ = logits.cpu().numpy(), values.cpu().numpy()
-    board_features *= CELL_COUNT
-    np.rint(board_features, out=board_features)
     board_storage[0] = board_features
-    board_storage[0, :, :, POTENTIAL_CHANNEL] = 0
-    future_storage[0] = future_features
     synchronize(device)
-    return time.perf_counter() - started, (board_storage, future_storage)
+    return time.perf_counter() - started, (board_storage,)
 
 
 def _parallel_rollout_worker(
@@ -139,14 +127,9 @@ def _parallel_rollout_worker(
 
         # Initialize CUDA/cuBLAS before the synchronized measurement.
         with torch.inference_mode():
-            warmup_boards = torch.zeros(
-                (1, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE), device=device
-            )
-            warmup_futures = torch.zeros(
-                (1, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH), device=device
-            )
+            warmup_boards = torch.zeros((1, BOARD_CHANNELS, SIDE, SIDE), device=device)
             warmup_potentials = torch.zeros((1, ACTION_COUNT), device=device)
-            model(warmup_boards, warmup_futures, warmup_potentials, 12.0)
+            model(warmup_boards, warmup_potentials, 12.0)
         synchronize(device)
         result_queue.put(("ready", worker, None))
         if not start_event.wait(timeout=120):
@@ -235,21 +218,13 @@ def benchmark_parallel_rollout_turn(
 def synthetic_rollout(transitions: int, rng: np.random.Generator) -> PpoRollout:
     board_features = rng.integers(
         0,
-        CELL_COUNT + 1,
-        size=(transitions, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE),
-        dtype=np.uint8,
-    )
-    board_features[:, :, POTENTIAL_CHANNEL] = 0
-    future_features = rng.integers(
-        0,
         2,
-        size=(transitions, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH),
+        size=(transitions, BOARD_CHANNELS, SIDE, SIDE),
         dtype=np.uint8,
     )
     potentials = rng.random((transitions, ACTION_COUNT), dtype=np.float32)
     return PpoRollout(
         board_features=board_features,
-        future_features=future_features,
         candidate_potentials=potentials,
         actions=rng.integers(ACTION_COUNT, size=transitions, dtype=np.int64),
         old_log_probs=np.zeros(transitions, dtype=np.float32),
@@ -373,12 +348,7 @@ def main() -> None:
         )
         # Both workers together retain the same number of episode features as
         # the single-process collector; no large arrays cross process bounds.
-        buffer_bytes = (
-            (CELL_COUNT - 1)
-            * args.episodes
-            * ACTION_COUNT
-            * (BOARD_CHANNELS * SIDE * SIDE + FUTURE_CHANNELS * FUTURE_LENGTH)
-        )
+        buffer_bytes = (CELL_COUNT - 1) * args.episodes * BOARD_CHANNELS * SIDE * SIDE
         buffer_write_seconds = math.nan
     update_seconds = benchmark_updates(
         execution_model,

@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from .features import BOARD_CHANNELS, FUTURE_CHANNELS, FUTURE_LENGTH
+from .features import BOARD_CHANNELS
 from .game import ACTION_COUNT, CELL_COUNT, SIDE
 from .model import Ahc015PpoNet
 from .ppo import PpoRollout, PpoRolloutStorage, collect_ppo_rollout, ppo_update
@@ -32,7 +32,6 @@ class _SharedArray:
 @dataclass(frozen=True, slots=True)
 class _SharedRollout:
     board_features: _SharedArray
-    future_features: _SharedArray
     candidate_potentials: _SharedArray
     actions: _SharedArray
     old_log_probs: _SharedArray
@@ -50,10 +49,7 @@ class _SharedRollout:
         transitions = arrays["actions"].size
         return PpoRollout(
             board_features=arrays["board_features"].reshape(
-                transitions, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE
-            ),
-            future_features=arrays["future_features"].reshape(
-                transitions, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH
+                transitions, BOARD_CHANNELS, SIDE, SIDE
             ),
             candidate_potentials=arrays["candidate_potentials"].reshape(transitions, ACTION_COUNT),
             actions=arrays["actions"].reshape(transitions),
@@ -83,12 +79,7 @@ def _create_shared_rollout(context: Any, workers: int, episodes_per_worker: int)
     return _SharedRollout(
         board_features=_shared_array(
             context,
-            (*prefix, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE),
-            np.dtype(np.uint8),
-        ),
-        future_features=_shared_array(
-            context,
-            (*prefix, ACTION_COUNT, FUTURE_CHANNELS, FUTURE_LENGTH),
+            (*prefix, BOARD_CHANNELS, SIDE, SIDE),
             np.dtype(np.uint8),
         ),
         candidate_potentials=_shared_array(context, (*prefix, ACTION_COUNT), np.dtype(np.float32)),
