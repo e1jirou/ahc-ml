@@ -5,6 +5,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from examples.ahc015.python.afterstate_features import encode_afterstates
+from examples.ahc015.python.afterstate_model import AfterstatePpoNet, AfterstateValueNet
+from examples.ahc015.python.afterstate_ppo import collect_afterstate_ppo_rollout
+from examples.ahc015.python.afterstate_simulation import evaluate_afterstate_policy
 from examples.ahc015.python.config import load_config
 from examples.ahc015.python.features import (
     BOARD_CHANNELS,
@@ -188,6 +192,11 @@ def test_config_and_ppo_model_shapes() -> None:
     assert config.training.rollout_processes == 1
     assert config.training.learning_rate == 3e-4
     assert config.ppo.gamma == 1.0
+    afterstate_config = load_config(config_directory / "config_afterstate.toml")
+    assert afterstate_config.model.input_mode == "afterstate"
+    assert afterstate_config.model.channels == 64
+    assert afterstate_config.model.residual_blocks == 10
+    assert afterstate_config.training.max_hours == 5.0
     fine_tune_config = load_config(config_directory / "config_finetune.toml")
     assert fine_tune_config.training.max_hours == 2.0
     assert fine_tune_config.training.learning_rate == 2.5e-4
@@ -257,6 +266,63 @@ def test_zero_actor_is_exact_phi_greedy_after_normalization() -> None:
         Ahc015ValueNet().eval(), device, flavors, ranks, inference_batch_size=4
     )
     assert np.array_equal(actual.scores, expected.scores)
+
+
+def test_afterstate_features_model_and_phi_greedy() -> None:
+    flavors = np.resize(np.array([1, 2, 3], dtype=np.uint8), CELL_COUNT)
+    board = empty_board()
+    board[3, 4] = 1
+    candidates = afterstates(board)
+    features = encode_afterstates(candidates, np.arange(ACTION_COUNT), 1, flavors)
+    assert features.shape == (ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
+    assert np.all(features.sum(axis=1) == 1)
+
+    model = AfterstatePpoNet().eval()
+    candidate_inputs = torch.from_numpy(features[None])
+    potentials = torch.rand(1, ACTION_COUNT)
+    with torch.inference_mode():
+        logits, values = model(candidate_inputs, potentials, 12.0)
+    assert torch.allclose(logits, 12.0 * potentials)
+    assert torch.equal(values, torch.zeros(1))
+
+    evaluation_flavors, ranks = generate_cases(4, 15030)
+    device = torch.device("cpu")
+    expected = evaluate_afterstate_policy(
+        None, device, evaluation_flavors, ranks, inference_batch_size=16
+    )
+    actual = evaluate_afterstate_policy(
+        AfterstateValueNet().eval(),
+        device,
+        evaluation_flavors,
+        ranks,
+        inference_batch_size=16,
+    )
+    assert np.array_equal(actual.scores, expected.scores)
+
+
+def test_afterstate_rollout_smoke() -> None:
+    rollout, result, metrics = collect_afterstate_ppo_rollout(
+        AfterstatePpoNet(),
+        torch.device("cpu"),
+        episodes=2,
+        rng=np.random.default_rng(15031),
+        gamma=1.0,
+        gae_lambda=0.95,
+        logit_scale=12.0,
+        inference_batch_size=8,
+    )
+    assert len(rollout) == 2 * 99
+    assert rollout.board_features.shape == (
+        2 * 99,
+        ACTION_COUNT,
+        BOARD_CHANNELS,
+        SIDE,
+        SIDE,
+    )
+    assert np.all(rollout.board_features.sum(axis=2) == 1)
+    assert np.all(np.isfinite(rollout.advantages))
+    assert np.all((result.potentials >= 0) & (result.potentials <= 1))
+    assert metrics["rollout/mean_score"] > 0
 
 
 def test_generalized_advantages_terminal_and_shape() -> None:

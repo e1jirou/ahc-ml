@@ -1003,3 +1003,62 @@
   改善が続いた。一方、従来teacherの固定評価best 798,724とは約48,000点の差があり、容量・afterstate表現・
   未来列・派生特徴のどれが差を生むかは本実験単独では分離できない。単純モデルを有力baselineとして残し、
   次は変更を1要素ずつ戻すablationで寄与を測る
+
+## small-20260828-151420
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260828-151420`
+- input mode: afterstate
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15029
+- wall-clock limit: 5.000 hours
+- W&B: online, run ID `ze26mqfe`
+- status: time limit reached
+- elapsed: 5.046 hours
+- updates: 15048
+- best paired gain: 378466.434
+- 目的: pre-tilt版と入力方式だけを比較するため、傾斜後の4候補を共有モデルへ1つずつ入力した。
+  canonical味3面＋空きマス1面、64 channel・10 block、未来列なし、`Phi` baselineとPPO設定は揃えた
+- モデル規模: actor 50,433 parameter。rolloutは各transitionにつき4候補を保持するためfeature bufferは
+  0.604 GiBとなり、pre-tilt版の0.151 GiBの4倍だった
+- 完走確認: iteration 0から37まで38 iteration、15,409,152 transition、15,048 optimizer update。
+  early stopはなく、全iterationが4,096局・1 epoch・396 updateを完遂した
+- 固定512ケース: bestはiteration 33の平均726,879、greedy比+378,466、勝率100%。評価gainの各期間平均は
+  最初の12 iterationが260,064、中間13 iterationが337,729、最後13 iterationが369,551で、学習は継続していた
+- 更新指標: rollout entropyは最初5 iteration平均1.3454から最後5 iteration平均0.3609へ低下した。
+  平均KL 0.00478、clip fraction 5.47%で更新は安定していた
+- 速度: rollout平均198.890秒、最適化平均251.561秒、evaluation平均27.407秒、iteration平均477.909秒
+  （7.97分）。同じ4,096局でもpre-tilt版の約3.6分より遅いため、比較はiteration数でなくwall-clockを揃える
+
+## small-20260828-230251
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260828-230251`
+- input mode: afterstate
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15030
+- wall-clock limit: 10.000 hours
+- W&B: online, run ID `0if54qbx`
+- status: time limit reached
+- elapsed: 10.026 hours
+- updates: 43164
+- best paired gain: 422974.883
+- 継続条件: 5時間runの`best-training.pt`（iteration 33）から再開し、rolloutの重複を避けるためseedを
+  `15030`へ変更。learning rate `3e-4`など他の条件は維持した
+- 完走確認: iteration 34から108まで75 iteration、30,412,800 transitionと29,700 optimizer updateを
+  追加した。継続前を含む累計は44,199,936 transition、43,164 update。early stopはなかった
+- 固定512ケース: 最初5回平均725,708（greedy比+377,295）に対し最後5回平均769,024
+  （greedy比+420,611）で+43,316点。bestはiteration 107の平均771,388、greedy比+422,975、
+  勝率100%で、継続元bestを+44,508点更新した
+- 更新指標: 平均KL 0.00436、clip fraction 4.88%、explained variance 0.9727。rollout entropyは最初5回の
+  0.3418から最後5回の0.2144へ低下したが、性能改善は継続していた
+- 速度: rollout平均197.480秒、最適化平均256.204秒、evaluation平均27.460秒、iteration平均481.166秒
+  （8.02分）
+- 独立評価: 学習・best選択に未使用の同一2,000件、seed `20260828`で15時間相当のbest同士を比較した。
+  pre-tilt版は平均748,286.815（SE 1,891.610）、greedy比+402,740.656だった。afterstate版は
+  平均764,943.646（SE 1,815.051）、greedy比+419,397.488で、平均スコアが+16,656.832点高かった
+- 判断: 固定評価と独立評価の両方でafterstate版がpre-tilt版を上回った。afterstate版は4候補の評価により
+  計算が遅く、同じ約15時間での累計transitionはpre-tilt版99,348,480の約45%だが、それでも高い性能に
+  到達した。性能を優先する今後の標準構成にはafterstate入力を採用し、pre-tilt版は高速な比較基準として残す

@@ -13,6 +13,8 @@ import torch
 from ahc_ml.checkpoint import load_checkpoint
 from ahc_ml.device import select_device
 
+from .afterstate_model import AfterstateValueNet
+from .afterstate_simulation import evaluate_afterstate_policy
 from .game import EpisodeState, official_score
 from .model import Ahc015ValueNet, dimensions_from_state_dict
 from .simulation import evaluate_policy, evaluate_random_policy, generate_cases
@@ -126,9 +128,18 @@ def main() -> None:
     if args.checkpoint is not None:
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         channels, residual_blocks = dimensions_from_state_dict(checkpoint["model_state_dict"])
-        model = Ahc015ValueNet(channels, residual_blocks).to(device)
+        input_mode = checkpoint.get("config", {}).get("model", {}).get("input_mode")
+        if input_mode is None:
+            output_size = checkpoint["model_state_dict"]["output.weight"].shape[0]
+            input_mode = "afterstate" if output_size == 1 else "pretilt"
+        if input_mode == "afterstate":
+            model = AfterstateValueNet(channels, residual_blocks).to(device)
+            learned_evaluator = evaluate_afterstate_policy
+        else:
+            model = Ahc015ValueNet(channels, residual_blocks).to(device)
+            learned_evaluator = evaluate_policy
         load_checkpoint(args.checkpoint, model=model, map_location=device)
-        learned = evaluate_policy(
+        learned = learned_evaluator(
             model,
             device,
             flavors,

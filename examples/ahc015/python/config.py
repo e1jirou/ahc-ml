@@ -36,6 +36,7 @@ class TrainingConfig:
 class ModelConfig:
     channels: int
     residual_blocks: int
+    input_mode: str = "pretilt"
 
 
 @dataclass(frozen=True)
@@ -121,6 +122,8 @@ def load_config(path: str | Path) -> Ahc015Config:
         raise ValueError("training.micro_batch_size must not exceed training.batch_size")
     if config.training.rollout_processes not in {1, 2}:
         raise ValueError("training.rollout_processes must be 1 or 2")
+    if config.model.input_mode not in {"pretilt", "afterstate"}:
+        raise ValueError("model.input_mode must be pretilt or afterstate")
     if config.ppo.gamma != 1.0:
         raise ValueError("ppo.gamma must be 1.0 so potential shaping preserves the objective")
     if not 0 < config.ppo.gae_lambda <= 1:

@@ -17,6 +17,9 @@ from ahc_ml.seed import seed_everything
 from ahc_ml.tracking import WandbTracker
 from ahc_ml.visualization import render_model_graph
 
+from .afterstate_model import AfterstatePpoNet
+from .afterstate_ppo import collect_afterstate_ppo_rollout, update_afterstate_ppo
+from .afterstate_simulation import evaluate_afterstate_policy
 from .config import Ahc015Config, load_config
 from .features import BOARD_CHANNELS
 from .game import SIDE
@@ -60,21 +63,26 @@ def append_experiment_log(path: Path, text: str) -> None:
 
 def evaluate(
     evaluation_model: torch.nn.Module,
-    training_model: Ahc015PpoNet,
+    training_model: torch.nn.Module,
     device: torch.device,
     config: Ahc015Config,
     parallel_runtime: ParallelAhc015Runtime | None,
 ) -> dict[str, float]:
     flavors, ranks = generate_cases(config.evaluation.episodes, config.evaluation.seed)
     if parallel_runtime is None:
-        greedy_scores = evaluate_policy(
+        policy_evaluator = (
+            evaluate_afterstate_policy
+            if config.model.input_mode == "afterstate"
+            else evaluate_policy
+        )
+        greedy_scores = policy_evaluator(
             None,
             device,
             flavors,
             ranks,
             inference_batch_size=config.training.inference_batch_size,
         ).scores
-        learned_scores = evaluate_policy(
+        learned_scores = policy_evaluator(
             evaluation_model,
             device,
             flavors,
@@ -100,7 +108,7 @@ def evaluate(
 
 def load_training_checkpoint(
     path: Path,
-    model: Ahc015PpoNet,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> dict[str, object]:
@@ -200,9 +208,16 @@ def main() -> None:
     print(f"W&B mode: {config.wandb.mode}, run ID: {tracker.run_id}")
     print(f"wall-clock limit: {config.training.max_hours:.3f} hours")
 
-    model = Ahc015PpoNet(config.model.channels, config.model.residual_blocks)
+    if config.model.input_mode == "afterstate":
+        model = AfterstatePpoNet(config.model.channels, config.model.residual_blocks)
+        collect_rollout = collect_afterstate_ppo_rollout
+        update_ppo = update_afterstate_ppo
+    else:
+        model = Ahc015PpoNet(config.model.channels, config.model.residual_blocks)
+        collect_rollout = collect_ppo_rollout
+        update_ppo = ppo_update
     print(
-        f"model: {config.model.channels} channels x "
+        f"model: {config.model.input_mode}, {config.model.channels} channels x "
         f"{config.model.residual_blocks} blocks, {parameter_count(model.actor):,} actor parameters"
     )
     graph_svg, graph_png = render_model_graph(
@@ -213,10 +228,12 @@ def main() -> None:
     tracker.log_image(
         graph_png,
         key="model/architecture",
-        caption="AHC015 PPO actor (the critic has the same architecture)",
+        caption=f"AHC015 {config.model.input_mode} PPO actor",
     )
     print(f"actor graph: {graph_svg}")
     use_parallel_runtime = config.training.rollout_processes > 1
+    if use_parallel_runtime and config.model.input_mode != "pretilt":
+        raise RuntimeError("parallel rollout currently supports only pretilt input")
     model_device = torch.device("cpu") if use_parallel_runtime else device
     model = model.to(model_device)
     optimizer = torch.optim.AdamW(
@@ -302,6 +319,7 @@ def main() -> None:
         log_path,
         f"\n## {run_name}\n\n"
         f"- algorithm: PPO\n- status: started\n- output: `{output_dir}`\n"
+        f"- input mode: {config.model.input_mode}\n"
         f"- device: {device_info.selected} ({device_info.name})\n"
         f"- seed: {config.run.seed}\n"
         f"- wall-clock limit: {config.training.max_hours:.3f} hours\n"
@@ -315,7 +333,7 @@ def main() -> None:
         iteration_started = time.monotonic()
         rollout_started = time.monotonic()
         if parallel_runtime is None:
-            rollout, _, rollout_metrics = collect_ppo_rollout(
+            rollout, _, rollout_metrics = collect_rollout(
                 execution_model,
                 device,
                 config.training.rollout_episodes,
@@ -341,7 +359,7 @@ def main() -> None:
         }
         optimization_started = time.monotonic()
         if parallel_runtime is None:
-            update_metrics = ppo_update(
+            update_metrics = update_ppo(
                 execution_model,
                 optimizer,
                 rollout,

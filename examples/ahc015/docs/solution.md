@@ -2,8 +2,9 @@
 
 ## 方針
 
-各ターンの傾斜前盤面を1回だけactorへ入力し、4方向の残差を同時に出力する。特徴量とモデル容量の
-過剰性を調べるため、入力は種類別占有と空きマスだけ、モデル幅は64 channelとする。
+特徴量とモデル容量の過剰性を調べるため、入力は種類別占有と空きマスだけ、モデル幅は64 channelとする。
+傾斜前盤面を1回入力するpre-tilt版と、4方向の傾斜後盤面を1つずつ入力するafterstate版を同条件で比較し、
+約15時間の学習後に性能の高かったafterstate版を採用する。pre-tilt版は比較基準として実装を残す。
 
 ## 問題の定式化
 
@@ -25,10 +26,11 @@ score  = round(1,000,000 * Phi(B))
 
 ## 方策
 
-actorは傾斜前特徴 `x(B_t)` から4方向の残差 `G_theta(B_t, a)` を同時に出力する。4方向のlogitは
+採用するafterstate版のactorは、方向を正規化した各傾斜後盤面の特徴 `x(W_t^a, a)` から残差を1個ずつ
+出力する。4方向のlogitは
 
 ```text
-logit_t(a) = temperature * (Phi(W_t^a) + G_theta(B_t, a))
+logit_t(a) = temperature * (Phi(W_t^a) + G_theta(x(W_t^a, a)))
 temperature = 12
 ```
 
@@ -36,10 +38,10 @@ temperature = 12
 argmaxを変えない。actorの最終層をゼロ初期化するので、学習開始時は厳密に`Phi`貪欲方策になる。
 これにより完全ランダムな初期方策で悪い状態ばかり集めることを避ける。
 
-criticはactorと同じbackboneの別ネットワークで、傾斜前盤面から状態価値を1個出力する。
+criticはactorと同じbackboneの別ネットワークで4候補を評価し、その平均を傾斜前状態の価値とする。
 
 ```text
-V_psi(B_t) = V_psi(x(B_t))
+V_psi(B_t) = mean_a V_psi(x(W_t^a, a))
 ```
 
 criticは学習時のpolicy gradientのbaselineとして使う。
@@ -112,11 +114,15 @@ L = L_policy + value_coefficient * L_value - entropy_coefficient * entropy
 
 ## 対称性と入力特徴
 
-味番号には `3!`、盤面には正方形の回転・反転対称性がある。各傾斜前盤面について次を行う。
+味番号には `3!`、盤面には正方形の回転・反転対称性がある。採用するafterstate版では各候補について
+次を行う。
 
 1. 次に出現する時刻、最終個数、初出時刻により味をcanonical IDへ写す。
-2. 回転・反転8通りを辞書順比較し、小さい盤面を採用する。
-3. canonical盤面での4方向出力を、選択した変換の逆写像で元盤面の方向へ戻す。
+2. 候補を生成した傾斜方向が上になるよう盤面を回転する。
+3. 左右反転前後を辞書順比較し、小さい盤面を採用する。
+
+pre-tilt版では傾斜前盤面の回転・反転8通りから辞書順最小を採用し、canonical盤面の4方向出力を
+逆写像で元盤面の方向へ戻す。
 
 盤面入力は `(4, 10, 10)` の`f32`である。未来列は入力しない。
 
@@ -137,11 +143,32 @@ board input (4, 10, 10):
     [DepthwiseConv 3x3, ReLU, Conv 1x1, skip, ReLU] x blocks
     Global average pooling -> width
 
-actor head: Linear width -> 4
-critic head: Linear width -> 1
+afterstate actor/critic head: Linear width -> 1
+pre-tilt actor head: Linear width -> 4
+pre-tilt critic head: Linear width -> 1
 ```
 
 Batch NormalizationとDropoutは使わない。
+
+## 入力方式比較と採用判断
+
+入力方式だけのablationとして、4方向の傾斜後盤面を共有ネットワークへ1つずつ入力する構成を追加した。
+各afterstateは対応する傾斜方向が上になるよう回転し、左右反転の辞書順最小を採用する。特徴量、味正規化、
+64 channel・10 block、`Phi` baseline、PPO設定はpre-tilt版と揃える。actorは各候補から残差を1個出力し、
+criticは4候補の出力平均を状態価値とする。これにより入力方式以外の差を抑える。
+
+両方式をローカルMPSで約15時間ずつ学習し、学習・best選択に使っていない同一2,000ケース
+（seed `20260828`）で評価した。
+
+| 入力方式 | 平均スコア | `Phi`貪欲比 | 平均スコアSE |
+| --- | ---: | ---: | ---: |
+| pre-tilt | 748,286.815 | +402,740.656 | 1,891.610 |
+| afterstate | 764,943.646 | +419,397.488 | 1,815.051 |
+
+afterstate版は16,656.832点高く、固定512ケースのbestでもpre-tilt版の`+401,973.766`に対して
+`+422,974.883`だった。afterstate版は4候補を評価するため計算量が大きく、累計transitionもpre-tilt版の
+99,348,480に対して44,199,936に留まるが、それでも同じwall-clock予算で性能が上回った。以上から、
+性能を優先する本解法ではafterstate版を採用し、pre-tilt版は高速な比較基準として残す。
 
 ## 実装上の確認事項
 
