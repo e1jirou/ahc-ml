@@ -49,6 +49,10 @@ class PpoConfig:
     entropy_coefficient: float
     logit_scale: float
     target_kl: float
+    policy_phi_coefficient_start: float = 1.0
+    policy_phi_coefficient_end: float = 1.0
+    policy_phi_anneal_hours: float = 0.0
+    reward_mode: str = "potential_shaping"
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,7 @@ class EvaluationConfig:
     interval: int
     episodes: int
     seed: int
+    phi_greedy_baseline: bool = True
 
 
 @dataclass(frozen=True)
@@ -130,6 +135,31 @@ def load_config(path: str | Path) -> Ahc015Config:
         raise ValueError("ppo.gae_lambda must be in (0, 1]")
     if config.ppo.entropy_coefficient < 0:
         raise ValueError("ppo.entropy_coefficient must be non-negative")
+    if config.ppo.policy_phi_coefficient_start < 0:
+        raise ValueError("ppo.policy_phi_coefficient_start must be non-negative")
+    if config.ppo.policy_phi_coefficient_end < 0:
+        raise ValueError("ppo.policy_phi_coefficient_end must be non-negative")
+    if config.ppo.policy_phi_anneal_hours < 0:
+        raise ValueError("ppo.policy_phi_anneal_hours must be non-negative")
+    if (
+        config.ppo.policy_phi_coefficient_start
+        != config.ppo.policy_phi_coefficient_end
+        and config.ppo.policy_phi_anneal_hours == 0
+    ):
+        raise ValueError("ppo.policy_phi_anneal_hours must be positive when coefficients differ")
+    if config.ppo.reward_mode not in {"potential_shaping", "terminal"}:
+        raise ValueError("ppo.reward_mode must be potential_shaping or terminal")
+    if config.ppo.reward_mode == "terminal":
+        if config.model.input_mode != "afterstate":
+            raise ValueError("terminal reward mode currently supports only afterstate input")
+        if config.ppo.policy_phi_coefficient_start != 0:
+            raise ValueError("terminal reward mode requires policy Phi start coefficient 0")
+        if config.ppo.policy_phi_coefficient_end != 0:
+            raise ValueError("terminal reward mode requires policy Phi end coefficient 0")
+        if config.ppo.gae_lambda != 1.0:
+            raise ValueError("terminal reward mode requires ppo.gae_lambda = 1.0")
+        if config.evaluation.phi_greedy_baseline:
+            raise ValueError("terminal reward mode requires Phi-greedy evaluation to be disabled")
     if config.wandb.mode not in {"online", "offline", "disabled"}:
         raise ValueError("wandb.mode must be online, offline, or disabled")
     return config

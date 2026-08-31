@@ -113,20 +113,29 @@ def main() -> None:
         raise ValueError("--rust-model requires --rust-executable")
     device, _ = select_device(args.device)
     flavors, ranks = generate_cases(args.episodes, args.seed)
-    random_result = evaluate_random_policy(flavors, ranks, seed=args.seed + 1)
-    greedy = evaluate_policy(
-        None,
-        device,
-        flavors,
-        ranks,
-        inference_batch_size=args.inference_batch_size,
-    )
-    reports = [
-        summarize("random", random_result.scores),
-        summarize("phi-greedy", greedy.scores),
-    ]
+    checkpoint = None
+    phi_greedy_baseline = True
     if args.checkpoint is not None:
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        phi_greedy_baseline = bool(
+            checkpoint.get("config", {})
+            .get("evaluation", {})
+            .get("phi_greedy_baseline", True)
+        )
+    random_result = evaluate_random_policy(flavors, ranks, seed=args.seed + 1)
+    reports = [summarize("random", random_result.scores)]
+    greedy = None
+    if phi_greedy_baseline:
+        greedy = evaluate_policy(
+            None,
+            device,
+            flavors,
+            ranks,
+            inference_batch_size=args.inference_batch_size,
+        )
+        reports.append(summarize("phi-greedy", greedy.scores))
+    if args.checkpoint is not None:
+        assert checkpoint is not None
         channels, residual_blocks = dimensions_from_state_dict(checkpoint["model_state_dict"])
         input_mode = checkpoint.get("config", {}).get("model", {}).get("input_mode")
         if input_mode is None:
@@ -139,24 +148,35 @@ def main() -> None:
             model = Ahc015ValueNet(channels, residual_blocks).to(device)
             learned_evaluator = evaluate_policy
         load_checkpoint(args.checkpoint, model=model, map_location=device)
+        learned_kwargs = {"inference_batch_size": args.inference_batch_size}
+        if input_mode == "afterstate":
+            checkpoint_metrics = checkpoint.get("metrics", {})
+            checkpoint_ppo = checkpoint.get("config", {}).get("ppo", {})
+            learned_kwargs["policy_phi_coefficient"] = float(
+                checkpoint_metrics.get(
+                    "training/policy_phi_coefficient",
+                    checkpoint_ppo.get("policy_phi_coefficient_start", 1.0),
+                )
+            )
         learned = learned_evaluator(
             model,
             device,
             flavors,
             ranks,
-            inference_batch_size=args.inference_batch_size,
+            **learned_kwargs,
         )
-        difference = learned.scores - greedy.scores
         report = summarize("learned", learned.scores)
-        report.update(
-            {
-                "paired_mean_gain": float(difference.mean()),
-                "paired_gain_standard_error": float(
-                    difference.std(ddof=1) / np.sqrt(len(difference))
-                ),
-                "win_rate": float(np.mean(difference > 0)),
-            }
-        )
+        if greedy is not None:
+            difference = learned.scores - greedy.scores
+            report.update(
+                {
+                    "paired_mean_gain": float(difference.mean()),
+                    "paired_gain_standard_error": float(
+                        difference.std(ddof=1) / np.sqrt(len(difference))
+                    ),
+                    "win_rate": float(np.mean(difference > 0)),
+                }
+            )
         reports.append(report)
     else:
         learned = None
@@ -168,17 +188,18 @@ def main() -> None:
             ranks,
             args.rust_workers,
         )
-        difference = rust_scores - greedy.scores
         report = summarize("rust-quantized", rust_scores)
-        report.update(
-            {
-                "paired_mean_gain": float(difference.mean()),
-                "paired_gain_standard_error": float(
-                    difference.std(ddof=1) / np.sqrt(len(difference))
-                ),
-                "win_rate": float(np.mean(difference > 0)),
-            }
-        )
+        if greedy is not None:
+            difference = rust_scores - greedy.scores
+            report.update(
+                {
+                    "paired_mean_gain": float(difference.mean()),
+                    "paired_gain_standard_error": float(
+                        difference.std(ddof=1) / np.sqrt(len(difference))
+                    ),
+                    "win_rate": float(np.mean(difference > 0)),
+                }
+            )
         if learned is not None:
             quantization_difference = rust_scores - learned.scores
             report.update(

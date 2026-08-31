@@ -25,7 +25,7 @@ BOARD_CHANNELS = 4
 @dataclass(frozen=True, slots=True)
 class AfterstatePpoRollout:
     board_features: NDArray[np.uint8]
-    candidate_potentials: NDArray[np.float32]
+    candidate_potentials: NDArray[np.float32] | None
     actions: NDArray[np.int64]
     old_log_probs: NDArray[np.float32]
     old_values: NDArray[np.float32]
@@ -54,7 +54,11 @@ def collect_afterstate_ppo_rollout(
     gae_lambda: float,
     logit_scale: float,
     inference_batch_size: int,
+    policy_phi_coefficient: float = 1.0,
+    reward_mode: str = "potential_shaping",
 ) -> tuple[AfterstatePpoRollout, EvaluationResult, dict[str, float]]:
+    if reward_mode not in {"potential_shaping", "terminal"}:
+        raise ValueError("reward_mode must be potential_shaping or terminal")
     flavors = rng.integers(1, 4, size=(episodes, CELL_COUNT), dtype=np.uint8)
     ranks = np.empty((episodes, CELL_COUNT), dtype=np.uint8)
     for turn in range(CELL_COUNT):
@@ -66,20 +70,29 @@ def collect_afterstate_ppo_rollout(
     board_storage = np.empty(
         (steps, episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE), dtype=np.uint8
     )
-    potential_storage = np.empty((steps, episodes, ACTION_COUNT), dtype=np.float32)
+    potential_storage = (
+        np.empty((steps, episodes, ACTION_COUNT), dtype=np.float32)
+        if policy_phi_coefficient != 0.0
+        else None
+    )
     action_storage = np.empty((steps, episodes), dtype=np.int64)
     log_prob_storage = np.empty((steps, episodes), dtype=np.float32)
     value_storage = np.empty((steps, episodes), dtype=np.float32)
-    state_potential_storage = np.empty((steps, episodes), dtype=np.float32)
+    state_potential_storage = (
+        np.empty((steps, episodes), dtype=np.float32)
+        if reward_mode == "potential_shaping"
+        else None
+    )
     entropy_steps: list[float] = []
 
     model.eval()
     for turn in range(steps):
         boards = place_at_ranks(boards, ranks[:, turn], flavors[:, turn])
-        state_potential_storage[turn] = np.asarray(
-            [potential(boards[i], score_denominators[i]) for i in range(episodes)],
-            dtype=np.float32,
-        )
+        if state_potential_storage is not None:
+            state_potential_storage[turn] = np.asarray(
+                [potential(boards[i], score_denominators[i]) for i in range(episodes)],
+                dtype=np.float32,
+            )
         candidates = afterstates_batch(boards)
         flat_features = encode_afterstates(
             candidates.reshape(episodes * ACTION_COUNT, SIDE, SIDE),
@@ -88,16 +101,18 @@ def collect_afterstate_ppo_rollout(
             np.repeat(flavors, ACTION_COUNT, axis=0),
         )
         board_features = flat_features.reshape(episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
-        candidate_potentials = np.asarray(
-            [
+        candidate_potentials = None
+        if policy_phi_coefficient != 0.0:
+            candidate_potentials = np.asarray(
                 [
-                    potential(candidates[episode, action], score_denominators[episode])
-                    for action in range(ACTION_COUNT)
-                ]
-                for episode in range(episodes)
-            ],
-            dtype=np.float32,
-        )
+                    [
+                        potential(candidates[episode, action], score_denominators[episode])
+                        for action in range(ACTION_COUNT)
+                    ]
+                    for episode in range(episodes)
+                ],
+                dtype=np.float32,
+            )
         probabilities = np.empty((episodes, ACTION_COUNT), dtype=np.float32)
         values_array = np.empty(episodes, dtype=np.float32)
         episode_batch_size = max(1, inference_batch_size // ACTION_COUNT)
@@ -105,8 +120,17 @@ def collect_afterstate_ppo_rollout(
             for start in range(0, episodes, episode_batch_size):
                 stop = min(start + episode_batch_size, episodes)
                 board_tensor = torch.from_numpy(board_features[start:stop]).to(device)
-                potential_tensor = torch.from_numpy(candidate_potentials[start:stop]).to(device)
-                logits, values = model(board_tensor, potential_tensor, logit_scale)
+                potential_tensor = (
+                    torch.from_numpy(candidate_potentials[start:stop]).to(device)
+                    if candidate_potentials is not None
+                    else None
+                )
+                logits, values = model(
+                    board_tensor,
+                    potential_tensor,
+                    logit_scale,
+                    policy_phi_coefficient,
+                )
                 probabilities[start:stop] = torch.softmax(logits, dim=1).cpu().numpy()
                 values_array[start:stop] = values.cpu().numpy()
         chosen = _sample_actions(probabilities, rng)
@@ -114,7 +138,9 @@ def collect_afterstate_ppo_rollout(
         boards = candidates[np.arange(episodes), chosen]
 
         board_storage[turn] = board_features
-        potential_storage[turn] = candidate_potentials
+        if potential_storage is not None:
+            assert candidate_potentials is not None
+            potential_storage[turn] = candidate_potentials
         action_storage[turn] = chosen
         log_prob_storage[turn] = np.log(np.maximum(chosen_probabilities, 1e-12))
         value_storage[turn] = values_array
@@ -125,9 +151,15 @@ def collect_afterstate_ppo_rollout(
         [potential(boards[i], score_denominators[i]) for i in range(episodes)],
         dtype=np.float32,
     )
-    state_potentials = state_potential_storage.T
-    next_potentials = np.concatenate((state_potentials[:, 1:], final_potentials[:, None]), axis=1)
-    rewards = next_potentials - state_potentials
+    if state_potential_storage is None:
+        rewards = np.zeros((episodes, steps), dtype=np.float32)
+        rewards[:, -1] = final_potentials
+    else:
+        state_potentials = state_potential_storage.T
+        next_potentials = np.concatenate(
+            (state_potentials[:, 1:], final_potentials[:, None]), axis=1
+        )
+        rewards = next_potentials - state_potentials
     values = value_storage.T
     advantages, returns = generalized_advantages(
         rewards, values, gamma=gamma, gae_lambda=gae_lambda
@@ -135,7 +167,11 @@ def collect_afterstate_ppo_rollout(
     transitions = steps * episodes
     rollout = AfterstatePpoRollout(
         board_features=board_storage.reshape(transitions, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE),
-        candidate_potentials=potential_storage.reshape(transitions, ACTION_COUNT),
+        candidate_potentials=(
+            potential_storage.reshape(transitions, ACTION_COUNT)
+            if potential_storage is not None
+            else None
+        ),
         actions=action_storage.reshape(transitions),
         old_log_probs=log_prob_storage.reshape(transitions),
         old_values=value_storage.reshape(transitions),
@@ -153,6 +189,14 @@ def collect_afterstate_ppo_rollout(
             "rollout/mean_score": float(scores.mean()),
             "rollout/value_mean": float(values.mean()),
             "rollout/feature_buffer_gib": board_storage.nbytes / (1024**3),
+            "rollout/policy_phi_coefficient": policy_phi_coefficient,
+            "rollout/state_phi_evaluations": float(
+                steps * episodes if state_potential_storage is not None else 0
+            ),
+            "rollout/candidate_phi_evaluations": float(
+                steps * episodes * ACTION_COUNT if potential_storage is not None else 0
+            ),
+            "rollout/final_phi_evaluations": float(episodes),
         },
     )
 
@@ -174,6 +218,7 @@ def update_afterstate_ppo(
     logit_scale: float,
     target_kl: float,
     micro_batch_size: int | None = None,
+    policy_phi_coefficient: float = 1.0,
 ) -> dict[str, float]:
     if micro_batch_size is None:
         micro_batch_size = batch_size
@@ -212,8 +257,10 @@ def update_afterstate_ppo(
                 boards = torch.from_numpy(rollout.board_features[micro_indices]).to(
                     device=device, dtype=torch.float32
                 )
-                potentials = torch.from_numpy(rollout.candidate_potentials[micro_indices]).to(
-                    device
+                potentials = (
+                    torch.from_numpy(rollout.candidate_potentials[micro_indices]).to(device)
+                    if rollout.candidate_potentials is not None
+                    else None
                 )
                 actions = torch.from_numpy(rollout.actions[micro_indices]).to(device)
                 old_log_probs = torch.from_numpy(rollout.old_log_probs[micro_indices]).to(device)
@@ -221,7 +268,12 @@ def update_afterstate_ppo(
                 micro_advantages = torch.from_numpy(advantages[micro_indices]).to(device)
                 returns = torch.from_numpy(rollout.returns[micro_indices]).to(device)
 
-                logits, values = model(boards, potentials, logit_scale)
+                logits, values = model(
+                    boards,
+                    potentials,
+                    logit_scale,
+                    policy_phi_coefficient,
+                )
                 distribution = torch.distributions.Categorical(logits=logits)
                 log_probs = distribution.log_prob(actions)
                 log_ratio = log_probs - old_log_probs

@@ -26,17 +26,18 @@ score  = round(1,000,000 * Phi(B))
 
 ## 方策
 
-採用するafterstate版のactorは、方向を正規化した各傾斜後盤面の特徴 `x(W_t^a, a)` から残差を1個ずつ
+採用するafterstate版のactorは、方向を正規化した各傾斜後盤面の特徴 `x(W_t^a, a)` から値を1個ずつ
 出力する。4方向のlogitは
 
 ```text
-logit_t(a) = temperature * (Phi(W_t^a) + G_theta(x(W_t^a, a)))
+logit_t(a) = temperature * G_theta(x(W_t^a, a))
 temperature = 12
 ```
 
 とする。学習時はCategorical分布からsampleし、提出時は最大logitを決定的に選ぶ。temperatureは
-argmaxを変えない。actorの最終層をゼロ初期化するので、学習開始時は厳密に`Phi`貪欲方策になる。
-これにより完全ランダムな初期方策で悪い状態ばかり集めることを避ける。
+argmaxを変えない。初期のafterstate学習では`Phi(W_t^a) + G_theta`を用いたが、学習済みcheckpointから
+policy Phi係数を3時間かけて`1`から`0`へannealし、その後は`G_theta`だけで行動を選ぶ構成を採用した。
+したがって、候補4方向のPhiは方策・推論では計算しない。
 
 criticはactorと同じbackboneの別ネットワークで4候補を評価し、その平均を傾斜前状態の価値とする。
 
@@ -72,6 +73,11 @@ R_t     = A_t + V(B_t)
 ```
 
 エピソード境界では次状態価値を0にする。batch全体でadvantageを平均0・標準偏差1へ正規化する。
+
+potential shapingを廃止し、終端公式スコアだけを報酬として`lambda = 1`で10時間継続するablationも
+実施した。しかし固定評価は学習開始時の778,415を一度も上回らず、未使用5,000ケースでも学習後モデルは
+基準より18,189.576点低かった。局内の99行動へ同じ終端結果を割り当てるだけではcredit assignmentの
+分散が大きいため、方策でのPhiは除く一方、学習報酬のpotential shapingは維持する。
 
 ## PPO更新
 
@@ -154,7 +160,8 @@ Batch NormalizationとDropoutは使わない。
 
 入力方式だけのablationとして、4方向の傾斜後盤面を共有ネットワークへ1つずつ入力する構成を追加した。
 各afterstateは対応する傾斜方向が上になるよう回転し、左右反転の辞書順最小を採用する。特徴量、味正規化、
-64 channel・10 block、`Phi` baseline、PPO設定はpre-tilt版と揃える。actorは各候補から残差を1個出力し、
+比較時は64 channel・10 block、`Phi` baseline、PPO設定をpre-tilt版と揃えた。actorは各候補から
+残差を1個出力し、
 criticは4候補の出力平均を状態価値とする。これにより入力方式以外の差を抑える。
 
 両方式をローカルMPSで約15時間ずつ学習し、学習・best選択に使っていない同一2,000ケース

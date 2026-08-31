@@ -20,7 +20,7 @@ from ahc_ml.visualization import render_model_graph
 from .afterstate_model import AfterstatePpoNet
 from .afterstate_ppo import collect_afterstate_ppo_rollout, update_afterstate_ppo
 from .afterstate_simulation import evaluate_afterstate_policy
-from .config import Ahc015Config, load_config
+from .config import Ahc015Config, PpoConfig, load_config
 from .features import BOARD_CHANNELS
 from .game import SIDE
 from .model import Ahc015PpoNet, parameter_count
@@ -67,6 +67,7 @@ def evaluate(
     device: torch.device,
     config: Ahc015Config,
     parallel_runtime: ParallelAhc015Runtime | None,
+    policy_phi_coefficient: float,
 ) -> dict[str, float]:
     flavors, ranks = generate_cases(config.evaluation.episodes, config.evaluation.seed)
     if parallel_runtime is None:
@@ -75,20 +76,25 @@ def evaluate(
             if config.model.input_mode == "afterstate"
             else evaluate_policy
         )
-        greedy_scores = policy_evaluator(
-            None,
-            device,
-            flavors,
-            ranks,
-            inference_batch_size=config.training.inference_batch_size,
-        ).scores
+        learned_kwargs = {"inference_batch_size": config.training.inference_batch_size}
+        if config.model.input_mode == "afterstate":
+            learned_kwargs["policy_phi_coefficient"] = policy_phi_coefficient
         learned_scores = policy_evaluator(
             evaluation_model,
             device,
             flavors,
             ranks,
-            inference_batch_size=config.training.inference_batch_size,
+            **learned_kwargs,
         ).scores
+        greedy_scores = None
+        if config.evaluation.phi_greedy_baseline:
+            greedy_scores = policy_evaluator(
+                None,
+                device,
+                flavors,
+                ranks,
+                inference_batch_size=config.training.inference_batch_size,
+            ).scores
     else:
         greedy_scores, learned_scores = parallel_runtime.evaluate(
             training_model,
@@ -96,14 +102,35 @@ def evaluate(
             ranks,
             inference_batch_size=config.training.inference_batch_size,
         )
-    difference = learned_scores - greedy_scores
-    return {
+    metrics = {
         "evaluation/mean_score": float(learned_scores.mean()),
-        "evaluation/greedy_mean_score": float(greedy_scores.mean()),
-        "evaluation/paired_gain": float(difference.mean()),
-        "evaluation/paired_gain_se": float(difference.std(ddof=1) / math.sqrt(len(difference))),
-        "evaluation/win_rate": float(np.mean(difference > 0)),
+        "evaluation/score_se": float(
+            learned_scores.std(ddof=1) / math.sqrt(len(learned_scores))
+        ),
     }
+    if greedy_scores is not None:
+        difference = learned_scores - greedy_scores
+        metrics.update(
+            {
+                "evaluation/greedy_mean_score": float(greedy_scores.mean()),
+                "evaluation/paired_gain": float(difference.mean()),
+                "evaluation/paired_gain_se": float(
+                    difference.std(ddof=1) / math.sqrt(len(difference))
+                ),
+                "evaluation/win_rate": float(np.mean(difference > 0)),
+            }
+        )
+    return metrics
+
+
+def scheduled_policy_phi_coefficient(config: PpoConfig, elapsed_hours: float) -> float:
+    if config.policy_phi_anneal_hours == 0:
+        return config.policy_phi_coefficient_end
+    progress = min(max(elapsed_hours / config.policy_phi_anneal_hours, 0.0), 1.0)
+    return (
+        config.policy_phi_coefficient_start
+        + (config.policy_phi_coefficient_end - config.policy_phi_coefficient_start) * progress
+    )
 
 
 def load_training_checkpoint(
@@ -207,6 +234,12 @@ def main() -> None:
     print(f"device: {device_info.selected} ({device_info.name})")
     print(f"W&B mode: {config.wandb.mode}, run ID: {tracker.run_id}")
     print(f"wall-clock limit: {config.training.max_hours:.3f} hours")
+    print(
+        "policy Phi coefficient: "
+        f"{config.ppo.policy_phi_coefficient_start:g} -> "
+        f"{config.ppo.policy_phi_coefficient_end:g} over "
+        f"{config.ppo.policy_phi_anneal_hours:g} hours"
+    )
 
     if config.model.input_mode == "afterstate":
         model = AfterstatePpoNet(config.model.channels, config.model.residual_blocks)
@@ -245,7 +278,8 @@ def main() -> None:
     environment_transitions = 0
     early_stop_count = 0
     start_iteration = 0
-    best_gain = -math.inf
+    best_score = -math.inf
+    phi_schedule_elapsed_offset = 0.0
     if args.resume is not None:
         checkpoint = load_training_checkpoint(args.resume, model, optimizer, model_device)
         # Optimizer checkpoints also contain their old learning rate.  Keep the
@@ -257,8 +291,23 @@ def main() -> None:
         update = int(checkpoint_metrics.get("training/update", 0))
         environment_transitions = int(checkpoint_metrics.get("training/environment_transitions", 0))
         early_stop_count = int(checkpoint_metrics.get("training/early_stop_count", 0))
-        best_gain = float(checkpoint_metrics.get("evaluation/paired_gain", -math.inf))
-        if math.isfinite(best_gain):
+        phi_schedule_elapsed_offset = float(
+            checkpoint_metrics.get("training/policy_phi_schedule_elapsed_hours", 0.0)
+        )
+        checkpoint_phi_coefficient = float(
+            checkpoint_metrics.get(
+                "training/policy_phi_coefficient",
+                config.ppo.policy_phi_coefficient_start,
+            )
+        )
+        checkpoint_is_target_policy = math.isclose(
+            checkpoint_phi_coefficient,
+            config.ppo.policy_phi_coefficient_end,
+            abs_tol=1e-12,
+        )
+        if checkpoint_is_target_policy:
+            best_score = float(checkpoint_metrics.get("evaluation/mean_score", -math.inf))
+        if math.isfinite(best_score):
             save_checkpoint(
                 output_dir / "best.pt",
                 model=model.actor,
@@ -323,6 +372,11 @@ def main() -> None:
         f"- device: {device_info.selected} ({device_info.name})\n"
         f"- seed: {config.run.seed}\n"
         f"- wall-clock limit: {config.training.max_hours:.3f} hours\n"
+        f"- policy Phi coefficient: {config.ppo.policy_phi_coefficient_start:g} -> "
+        f"{config.ppo.policy_phi_coefficient_end:g} over "
+        f"{config.ppo.policy_phi_anneal_hours:g} hours\n"
+        f"- reward mode: {config.ppo.reward_mode}\n"
+        f"- Phi-greedy evaluation: {config.evaluation.phi_greedy_baseline}\n"
         f"- W&B: {config.wandb.mode}, run ID `{tracker.run_id}`\n",
     )
 
@@ -331,17 +385,30 @@ def main() -> None:
             stopped_by_time_limit = True
             break
         iteration_started = time.monotonic()
+        phi_schedule_elapsed_hours = phi_schedule_elapsed_offset + (
+            iteration_started - training_started
+        ) / 3600
+        policy_phi_coefficient = scheduled_policy_phi_coefficient(
+            config.ppo,
+            phi_schedule_elapsed_hours,
+        )
         rollout_started = time.monotonic()
         if parallel_runtime is None:
+            collect_kwargs = dict(
+                gamma=config.ppo.gamma,
+                gae_lambda=config.ppo.gae_lambda,
+                logit_scale=config.ppo.logit_scale,
+                inference_batch_size=config.training.inference_batch_size,
+            )
+            if config.model.input_mode == "afterstate":
+                collect_kwargs["policy_phi_coefficient"] = policy_phi_coefficient
+                collect_kwargs["reward_mode"] = config.ppo.reward_mode
             rollout, _, rollout_metrics = collect_rollout(
                 execution_model,
                 device,
                 config.training.rollout_episodes,
                 rng,
-                gamma=config.ppo.gamma,
-                gae_lambda=config.ppo.gae_lambda,
-                logit_scale=config.ppo.logit_scale,
-                inference_batch_size=config.training.inference_batch_size,
+                **collect_kwargs,
             )
         else:
             rollout, _, rollout_metrics = parallel_runtime.collect(
@@ -359,12 +426,7 @@ def main() -> None:
         }
         optimization_started = time.monotonic()
         if parallel_runtime is None:
-            update_metrics = update_ppo(
-                execution_model,
-                optimizer,
-                rollout,
-                device,
-                rng,
+            update_kwargs = dict(
                 epochs=config.training.epochs,
                 batch_size=config.training.batch_size,
                 micro_batch_size=config.training.micro_batch_size,
@@ -375,6 +437,16 @@ def main() -> None:
                 gradient_clip_norm=config.training.gradient_clip_norm,
                 logit_scale=config.ppo.logit_scale,
                 target_kl=config.ppo.target_kl,
+            )
+            if config.model.input_mode == "afterstate":
+                update_kwargs["policy_phi_coefficient"] = policy_phi_coefficient
+            update_metrics = update_ppo(
+                execution_model,
+                optimizer,
+                rollout,
+                device,
+                rng,
+                **update_kwargs,
             )
         else:
             update_metrics = parallel_runtime.update(
@@ -400,6 +472,8 @@ def main() -> None:
         metrics["training/update"] = float(update)
         metrics["training/environment_transitions"] = float(environment_transitions)
         metrics["training/learning_rate"] = config.training.learning_rate
+        metrics["training/policy_phi_coefficient"] = policy_phi_coefficient
+        metrics["training/policy_phi_schedule_elapsed_hours"] = phi_schedule_elapsed_hours
         metrics["training/micro_batch_size"] = float(config.training.micro_batch_size)
         metrics["training/early_stop_count"] = float(early_stop_count)
         metrics["training/early_stop_rate"] = early_stop_count / (iteration + 1)
@@ -408,11 +482,25 @@ def main() -> None:
         should_evaluate = (iteration + 1) % config.evaluation.interval == 0
         if should_evaluate:
             evaluation_started = time.monotonic()
-            metrics.update(evaluate(evaluation_model, model, device, config, parallel_runtime))
+            metrics.update(
+                evaluate(
+                    evaluation_model,
+                    model,
+                    device,
+                    config,
+                    parallel_runtime,
+                    policy_phi_coefficient,
+                )
+            )
             metrics["timing/evaluation_seconds"] = time.monotonic() - evaluation_started
-            gain = metrics["evaluation/paired_gain"]
-            if gain > best_gain:
-                best_gain = gain
+            score = metrics["evaluation/mean_score"]
+            target_policy_reached = math.isclose(
+                policy_phi_coefficient,
+                config.ppo.policy_phi_coefficient_end,
+                abs_tol=1e-12,
+            )
+            if target_policy_reached and score > best_score:
+                best_score = score
                 save_checkpoint(
                     output_dir / "best.pt",
                     model=model.actor,
@@ -450,12 +538,30 @@ def main() -> None:
         last_metrics = metrics
         last_iteration = iteration
 
-    if "evaluation/paired_gain" not in last_metrics:
-        print("running final paired evaluation", flush=True)
-        last_metrics.update(evaluate(evaluation_model, model, device, config, parallel_runtime))
-        gain = last_metrics["evaluation/paired_gain"]
-        if gain > best_gain:
-            best_gain = gain
+    if "evaluation/mean_score" not in last_metrics:
+        print("running final evaluation", flush=True)
+        final_schedule_elapsed_hours = phi_schedule_elapsed_offset + (
+            time.monotonic() - training_started
+        ) / 3600
+        final_policy_phi_coefficient = scheduled_policy_phi_coefficient(
+            config.ppo,
+            final_schedule_elapsed_hours,
+        )
+        last_metrics["training/policy_phi_coefficient"] = final_policy_phi_coefficient
+        last_metrics["training/policy_phi_schedule_elapsed_hours"] = final_schedule_elapsed_hours
+        last_metrics.update(
+            evaluate(
+                evaluation_model,
+                model,
+                device,
+                config,
+                parallel_runtime,
+                final_policy_phi_coefficient,
+            )
+        )
+        score = last_metrics["evaluation/mean_score"]
+        if score > best_score:
+            best_score = score
             save_checkpoint(
                 output_dir / "best.pt",
                 model=model.actor,
@@ -472,15 +578,15 @@ def main() -> None:
                 config=config_dict,
                 metrics=last_metrics,
             )
-        tracker.log(
-            {
-                "final/mean_score": last_metrics["evaluation/mean_score"],
-                "final/paired_gain": last_metrics["evaluation/paired_gain"],
-                "final/paired_gain_se": last_metrics["evaluation/paired_gain_se"],
-                "final/win_rate": last_metrics["evaluation/win_rate"],
-            },
-            step=max(last_iteration + 1, 0),
-        )
+        final_metrics = {
+            "final/mean_score": last_metrics["evaluation/mean_score"],
+            "final/score_se": last_metrics["evaluation/score_se"],
+        }
+        for name in ("paired_gain", "paired_gain_se", "win_rate"):
+            key = f"evaluation/{name}"
+            if key in last_metrics:
+                final_metrics[f"final/{name}"] = last_metrics[key]
+        tracker.log(final_metrics, step=max(last_iteration + 1, 0))
 
     if parallel_runtime is not None:
         parallel_runtime.close()
@@ -496,9 +602,39 @@ def main() -> None:
             "training/update": float(update),
             "training/environment_transitions": float(environment_transitions),
             "training/early_stop_count": float(early_stop_count),
-            "evaluation/best_paired_gain": best_gain,
+            "training/policy_phi_coefficient": float(
+                last_metrics.get(
+                    "training/policy_phi_coefficient",
+                    config.ppo.policy_phi_coefficient_end,
+                )
+            ),
+            "training/policy_phi_schedule_elapsed_hours": float(
+                last_metrics.get(
+                    "training/policy_phi_schedule_elapsed_hours",
+                    phi_schedule_elapsed_offset + (time.monotonic() - training_started) / 3600,
+                )
+            ),
+            "evaluation/best_mean_score": best_score,
         },
     )
+    if not (output_dir / "best.pt").exists():
+        best_score = float(last_metrics.get("evaluation/mean_score", -math.inf))
+        save_checkpoint(
+            output_dir / "best.pt",
+            model=model.actor,
+            optimizer=optimizer,
+            epoch=last_iteration,
+            config=config_dict,
+            metrics=last_metrics,
+        )
+        save_checkpoint(
+            output_dir / "best-training.pt",
+            model=model,
+            optimizer=optimizer,
+            epoch=last_iteration,
+            config=config_dict,
+            metrics=last_metrics,
+        )
     load_checkpoint(output_dir / "best.pt", model=model.actor, map_location=model_device)
     tracker.log_artifact(
         output_dir / "best.pt", name=f"{run_name}-actor-checkpoint", artifact_type="model"
@@ -513,7 +649,7 @@ def main() -> None:
         log_path,
         f"- status: {'time limit reached' if stopped_by_time_limit else 'completed'}\n"
         f"- elapsed: {(time.monotonic() - training_started) / 3600:.3f} hours\n"
-        f"- updates: {update}\n- best paired gain: {best_gain:.3f}\n",
+        f"- updates: {update}\n- best mean score: {best_score:.3f}\n",
     )
 
 

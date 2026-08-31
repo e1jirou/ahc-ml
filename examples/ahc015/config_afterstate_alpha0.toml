@@ -1,5 +1,5 @@
 [run]
-seed = 15029
+seed = 15034
 device = "mps"
 deterministic = false
 output_dir = "outputs/ahc015"
@@ -32,11 +32,16 @@ value_coefficient = 0.5
 entropy_coefficient = 0.01
 logit_scale = 12.0
 target_kl = 0.03
+policy_phi_coefficient_start = 0.0
+policy_phi_coefficient_end = 0.0
+policy_phi_anneal_hours = 0.0
+reward_mode = "potential_shaping"
 
 [evaluation]
 interval = 2
 episodes = 2048
 seed = 515015
+phi_greedy_baseline = false
 
 [wandb]
 project = "ahc-ml"

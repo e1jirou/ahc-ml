@@ -3,11 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
+from examples.ahc015.python import afterstate_ppo as afterstate_ppo_module
 from examples.ahc015.python.afterstate_features import encode_afterstates
 from examples.ahc015.python.afterstate_model import AfterstatePpoNet, AfterstateValueNet
-from examples.ahc015.python.afterstate_ppo import collect_afterstate_ppo_rollout
+from examples.ahc015.python.afterstate_ppo import (
+    AfterstatePpoRollout,
+    collect_afterstate_ppo_rollout,
+    update_afterstate_ppo,
+)
 from examples.ahc015.python.afterstate_simulation import evaluate_afterstate_policy
 from examples.ahc015.python.config import load_config
 from examples.ahc015.python.features import (
@@ -51,6 +57,7 @@ from examples.ahc015.python.ppo import (
     ppo_update,
 )
 from examples.ahc015.python.simulation import evaluate_policy, generate_cases
+from examples.ahc015.python.train import scheduled_policy_phi_coefficient
 
 
 def test_tilts_compact_without_reordering() -> None:
@@ -197,6 +204,35 @@ def test_config_and_ppo_model_shapes() -> None:
     assert afterstate_config.model.channels == 64
     assert afterstate_config.model.residual_blocks == 10
     assert afterstate_config.training.max_hours == 5.0
+    assert afterstate_config.evaluation.interval == 2
+    assert afterstate_config.evaluation.episodes == 2048
+    no_phi_config = load_config(config_directory / "config_afterstate_no_phi.toml")
+    assert no_phi_config.run.seed == 15031
+    assert no_phi_config.model.input_mode == "afterstate"
+    assert no_phi_config.training.max_hours == 10.0
+    assert no_phi_config.ppo.policy_phi_coefficient_start == 1.0
+    assert no_phi_config.ppo.policy_phi_coefficient_end == 0.0
+    assert no_phi_config.ppo.policy_phi_anneal_hours == 3.0
+    assert no_phi_config.evaluation.interval == 2
+    assert no_phi_config.evaluation.episodes == 2048
+    alpha0_config = load_config(config_directory / "config_afterstate_alpha0.toml")
+    assert alpha0_config.run.seed == 15034
+    assert alpha0_config.model.channels == 64
+    assert alpha0_config.model.residual_blocks == 10
+    assert alpha0_config.ppo.policy_phi_coefficient_start == 0.0
+    assert alpha0_config.ppo.policy_phi_coefficient_end == 0.0
+    assert alpha0_config.ppo.reward_mode == "potential_shaping"
+    assert alpha0_config.ppo.gae_lambda == 0.95
+    assert not alpha0_config.evaluation.phi_greedy_baseline
+    terminal_config = load_config(config_directory / "config_afterstate_terminal.toml")
+    assert terminal_config.run.seed == 15033
+    assert terminal_config.model.channels == 64
+    assert terminal_config.model.residual_blocks == 10
+    assert terminal_config.ppo.policy_phi_coefficient_start == 0.0
+    assert terminal_config.ppo.policy_phi_coefficient_end == 0.0
+    assert terminal_config.ppo.reward_mode == "terminal"
+    assert terminal_config.ppo.gae_lambda == 1.0
+    assert not terminal_config.evaluation.phi_greedy_baseline
     fine_tune_config = load_config(config_directory / "config_finetune.toml")
     assert fine_tune_config.training.max_hours == 2.0
     assert fine_tune_config.training.learning_rate == 2.5e-4
@@ -300,6 +336,28 @@ def test_afterstate_features_model_and_phi_greedy() -> None:
     assert np.array_equal(actual.scores, expected.scores)
 
 
+def test_afterstate_policy_phi_coefficient_and_schedule() -> None:
+    torch.manual_seed(15031)
+    model = AfterstatePpoNet().eval()
+    torch.nn.init.normal_(model.actor.output.weight, std=0.01)
+    boards = torch.randn(2, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
+    potentials = torch.rand(2, ACTION_COUNT)
+    with torch.inference_mode():
+        logits_without_phi, _ = model(boards, None, 12.0, 0.0)
+        residuals = model.actor(boards.flatten(0, 1)).reshape(2, ACTION_COUNT)
+        logits_with_phi, _ = model(boards, potentials, 12.0, 0.5)
+    assert torch.allclose(logits_without_phi, 12.0 * residuals)
+    assert torch.allclose(logits_with_phi, 12.0 * (0.5 * potentials + residuals))
+
+    config = load_config(
+        Path(__file__).parents[2] / "examples" / "ahc015" / "config_afterstate_no_phi.toml"
+    )
+    assert scheduled_policy_phi_coefficient(config.ppo, 0.0) == 1.0
+    assert scheduled_policy_phi_coefficient(config.ppo, 1.5) == 0.5
+    assert scheduled_policy_phi_coefficient(config.ppo, 3.0) == 0.0
+    assert scheduled_policy_phi_coefficient(config.ppo, 8.0) == 0.0
+
+
 def test_afterstate_rollout_smoke() -> None:
     rollout, result, metrics = collect_afterstate_ppo_rollout(
         AfterstatePpoNet(),
@@ -320,9 +378,77 @@ def test_afterstate_rollout_smoke() -> None:
         SIDE,
     )
     assert np.all(rollout.board_features.sum(axis=2) == 1)
+    assert rollout.candidate_potentials is not None
     assert np.all(np.isfinite(rollout.advantages))
     assert np.all((result.potentials >= 0) & (result.potentials <= 1))
     assert metrics["rollout/mean_score"] > 0
+
+
+def test_afterstate_rollout_and_update_with_only_final_phi(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(15032)
+    model = AfterstatePpoNet()
+    torch.nn.init.normal_(model.actor.output.weight, std=0.01)
+    rng = np.random.default_rng(15032)
+    original_potential = afterstate_ppo_module.potential
+    phi_evaluations = 0
+
+    def counted_potential(board: np.ndarray, score_denominator: int) -> float:
+        nonlocal phi_evaluations
+        phi_evaluations += 1
+        return original_potential(board, score_denominator)
+
+    monkeypatch.setattr(afterstate_ppo_module, "potential", counted_potential)
+    rollout, _, metrics = collect_afterstate_ppo_rollout(
+        model,
+        torch.device("cpu"),
+        episodes=1,
+        rng=rng,
+        gamma=1.0,
+        gae_lambda=1.0,
+        logit_scale=12.0,
+        inference_batch_size=4,
+        policy_phi_coefficient=0.0,
+        reward_mode="terminal",
+    )
+    assert rollout.candidate_potentials is None
+    assert phi_evaluations == 1
+    assert metrics["rollout/state_phi_evaluations"] == 0
+    assert metrics["rollout/candidate_phi_evaluations"] == 0
+    assert metrics["rollout/final_phi_evaluations"] == 1
+    assert np.allclose(rollout.returns, rollout.returns[-1])
+
+    size = 2
+    short_rollout = AfterstatePpoRollout(
+        board_features=rollout.board_features[:size],
+        candidate_potentials=None,
+        actions=rollout.actions[:size],
+        old_log_probs=rollout.old_log_probs[:size],
+        old_values=rollout.old_values[:size],
+        advantages=rollout.advantages[:size],
+        returns=rollout.returns[:size],
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    update_metrics = update_afterstate_ppo(
+        model,
+        optimizer,
+        short_rollout,
+        torch.device("cpu"),
+        rng,
+        epochs=1,
+        batch_size=size,
+        micro_batch_size=1,
+        clip_ratio=0.2,
+        value_clip=0.2,
+        value_coefficient=0.5,
+        entropy_coefficient=0.01,
+        gradient_clip_norm=1.0,
+        logit_scale=12.0,
+        target_kl=0.03,
+        policy_phi_coefficient=0.0,
+    )
+    assert update_metrics["training/updates_this_iteration"] == 1
 
 
 def test_generalized_advantages_terminal_and_shape() -> None:

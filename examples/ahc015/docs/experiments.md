@@ -1062,3 +1062,101 @@
 - 判断: 固定評価と独立評価の両方でafterstate版がpre-tilt版を上回った。afterstate版は4候補の評価により
   計算が遅く、同じ約15時間での累計transitionはpre-tilt版99,348,480の約45%だが、それでも高い性能に
   到達した。性能を優先する今後の標準構成にはafterstate入力を採用し、pre-tilt版は高速な比較基準として残す
+
+## 2026-08-29 policy Phi除去・10時間（準備）
+
+- 目的: 特に序盤では候補盤面の`Phi`が近視眼的なpriorまたはノイズになり得るため、afterstate actorを
+  `Phi + G`から`G`単独の行動選択へ移行する
+- 継続元: `outputs/ahc015/small-20260828-230251/best-training.pt`（iteration 107、固定平均771,387.912）
+- schedule: wall-clockの最初3時間でpolicy Phi係数`alpha`を`1`から`0`へ線形減衰し、残り7時間は
+  `alpha=0`で学習する。既存checkpointのactor・critic・optimizerはそのまま引き継ぐ
+- 報酬: `Phi(S_{t+1}) - Phi(S_t)`のpotential shapingは維持し、行動選択に使う候補Phiだけを除く。
+  `alpha=0`到達後は4候補のPhiを計算・保存しない
+- checkpoint: anneal中の一時的な高スコアを最終no-policy-Phiモデルとして採用しないよう、best選択は
+  `alpha=0`到達後の固定評価に限定する。schedule累計時間と係数を保存し、再開時にも引き継ぐ
+- config: `examples/ahc015/config_afterstate_no_phi.toml`
+- seed: `15031`、時間: 10時間、device: MPS、W&B: online
+
+## small-20260829-230746
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260829-230746`
+- input mode: afterstate
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15031
+- wall-clock limit: 10.000 hours
+- policy Phi coefficient: 1 -> 0 over 3 hours
+- W&B: online, run ID `zhauzzxu`
+- status: time limit reached
+- elapsed: 10.110 hours
+- updates: 76824
+- best paired gain: 430076.818
+
+## small-20260830-091546
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260830-091546`
+- input mode: afterstate
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15032
+- wall-clock limit: 5.000 hours
+- policy Phi coefficient: 1 -> 0 over 3 hours
+- W&B: online, run ID `bo7kgqlq`
+- status: time limit reached
+- elapsed: 5.115 hours
+- updates: 93852
+- best paired gain: 431364.128
+
+## 2026-08-30 終端公式スコア報酬・Phi計算省略（準備）
+
+- 方針: policy Phi係数`alpha=0`を採用し、potential shapingも廃止する。連結成分に基づくPhiは各局の
+  最終公式スコアを求める1回だけ計算し、中間状態、4方向候補、Phi-greedy固定評価では計算しない
+- 継続元: `outputs/ahc015/small-20260830-091546/best-training.pt`（64 channel・10 block、alpha=0）
+- 報酬: 98手目まで0、最後のtransitionだけ正規化済み公式スコア`Phi(final_board)`。終端報酬を
+  全手へ伝播するため`gamma=1`、`gae_lambda=1`とする
+- 評価: 2 iterationごとに固定2,048ケース。Phi-greedyとのpaired gainではなく平均公式スコアで
+  bestを選ぶ。同一固定ケースではPhi-greedy平均が定数なので、bestの順位は従来と同じ
+- 計算量: rolloutでは1 iterationあたり4,096回、固定評価では2,048回だけPhiを計算する。
+  state Phiとcandidate Phiの評価回数をW&Bへ別々に記録し、いずれも0であることを確認できる
+- config: `examples/ahc015/config_afterstate_terminal.toml`
+- seed: `15033`、初回時間: 5時間、device: MPS、W&B: online
+
+## small-20260830-230316
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260830-230316`
+- input mode: afterstate
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15033
+- wall-clock limit: 10.000 hours
+- policy Phi coefficient: 0 -> 0 over 0 hours
+- reward mode: terminal
+- Phi-greedy evaluation: False
+- W&B: online, run ID `2a42u6f2`
+- status: time limit reached
+- elapsed: 10.034 hours
+- updates: 131472
+- best mean score: 778415.444
+- 完走確認: 10.034時間、iteration 237から331まで95 iteration、38,522,880 transitionと37,620 updateを
+  追加した。全iterationでpolicy Phi係数は0、state Phiとcandidate Phiの計算回数も0で、各局の
+  final Phi 1回だけを計算した
+- 固定2,048ケース: 継続元は平均778,415.444。terminal学習後の最高は最初の評価iteration 237の
+  776,401.390で、継続元を一度も上回らなかった。最初5評価平均774,666.291に対し最後5評価平均は
+  760,545.621まで低下し、最終評価は759,483.312だった。runの`best-training.pt`は学習後モデルではなく、
+  開始時にコピーした継続元checkpointである
+- 学習指標: explained varianceは切替直後の最初5 iteration平均-1.199から終盤5 iteration平均0.284まで
+  回復したが、potential shaping版の約0.98には遠い。rollout entropyも0.196から0.154へ低下し、性能が
+  悪化する方策への確信が強まった。early stopは0回で、PPO更新自体は完遂した
+- 速度: rollout平均107.492秒、評価平均35.719秒、iteration平均380.160秒。直前のpotential shaping版の
+  125.513秒、72.260秒、416.699秒に対し、それぞれ約14.4%、50.6%、8.8%短縮した
+- 独立評価: 学習・best選択に未使用の5,000ケース、seed `20260831`。継続元は平均777,387.834、
+  terminal学習後の`last.pt`は759,198.258。同一ケース差は-18,189.576 ±1,560.971、terminal版の
+  勝率42.76%、同率0.30%で、約11.7標準誤差の明確な悪化だった
+- 判断: 公式最終スコア以外のPhi計算省略には成功したが、終端報酬だけでは99行動へのcredit assignmentが
+  不十分で、学習するほど性能が低下したため不採用とする。policy Phi係数`alpha=0`は維持し、報酬には
+  `Phi(S_{t+1}) - Phi(S_t)`のpotential shapingを残す。今後の基準は
+  `outputs/ahc015/small-20260830-091546/best-training.pt`へ戻し、標準configを
+  `examples/ahc015/config_afterstate_alpha0.toml`とする

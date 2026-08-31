@@ -24,6 +24,7 @@ def evaluate_afterstate_policy(
     ranks: NDArray[np.uint8],
     *,
     inference_batch_size: int,
+    policy_phi_coefficient: float = 1.0,
 ) -> EvaluationResult:
     episodes = len(flavors)
     boards = np.zeros((episodes, SIDE, SIDE), dtype=np.uint8)
@@ -33,17 +34,20 @@ def evaluate_afterstate_policy(
         if turn + 1 == CELL_COUNT:
             break
         candidates = afterstates_batch(boards)
-        candidate_potentials = np.asarray(
-            [
+        candidate_potentials = None
+        if model is None or policy_phi_coefficient != 0.0:
+            candidate_potentials = np.asarray(
                 [
-                    potential(candidates[episode, action], score_denominators[episode])
-                    for action in range(ACTION_COUNT)
-                ]
-                for episode in range(episodes)
-            ],
-            dtype=np.float32,
-        )
+                    [
+                        potential(candidates[episode, action], score_denominators[episode])
+                        for action in range(ACTION_COUNT)
+                    ]
+                    for episode in range(episodes)
+                ],
+                dtype=np.float32,
+            )
         if model is None:
+            assert candidate_potentials is not None
             residuals = np.zeros_like(candidate_potentials)
         else:
             flat_features = encode_afterstates(
@@ -60,7 +64,14 @@ def evaluate_afterstate_policy(
                     inputs = torch.from_numpy(flat_features[start:stop]).to(device)
                     residuals[start:stop] = model(inputs).cpu().numpy()
             residuals = residuals.reshape(episodes, ACTION_COUNT)
-        selected = np.argmax(candidate_potentials + residuals, axis=1)
+        if model is None:
+            policy_values = candidate_potentials
+        elif policy_phi_coefficient == 0.0:
+            policy_values = residuals
+        else:
+            assert candidate_potentials is not None
+            policy_values = policy_phi_coefficient * candidate_potentials + residuals
+        selected = np.argmax(policy_values, axis=1)
         boards = candidates[np.arange(episodes), selected]
 
     potentials = np.asarray(

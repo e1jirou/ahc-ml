@@ -48,17 +48,21 @@ class AfterstatePpoNet(nn.Module):
     def forward(
         self,
         candidate_boards: torch.Tensor,
-        candidate_potentials: torch.Tensor,
+        candidate_potentials: torch.Tensor | None,
         logit_scale: float,
+        policy_phi_coefficient: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, action_count = candidate_boards.shape[:2]
         flat_boards = candidate_boards.flatten(0, 1)
         residuals = self.actor(flat_boards).reshape(batch_size, action_count)
         action_values = self.critic(flat_boards).reshape(batch_size, action_count)
-        return (
-            logit_scale * (candidate_potentials + residuals),
-            action_values.mean(dim=1),
-        )
+        if policy_phi_coefficient == 0.0:
+            policy_values = residuals
+        else:
+            if candidate_potentials is None:
+                raise ValueError("candidate_potentials are required when policy Phi is enabled")
+            policy_values = policy_phi_coefficient * candidate_potentials + residuals
+        return logit_scale * policy_values, action_values.mean(dim=1)
 
 
 def parameter_count(model: nn.Module) -> int:

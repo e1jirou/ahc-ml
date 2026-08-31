@@ -56,6 +56,40 @@ caffeinate -i env PYTHONPATH=python .venv/bin/python \
 
 W&Bのrun名は`small-<時刻>`となり、run configの`model.input_mode`で入力方式を識別できる。
 
+## Policy Phi除去実験
+
+`config_afterstate_no_phi.toml`は、既存afterstate checkpointから10時間継続し、行動logitに加える
+`Phi`の係数を最初の3時間で`1`から`0`へ線形に下げ、残り7時間を`Phi`なしで学習する設定である。
+PPOの密な報酬`Phi(S_{t+1}) - Phi(S_t)`は維持する。係数が`0`に到達すると、4方向の候補Phiは
+rollout・PPO更新・learned policy評価で計算も保存もしない。`best.pt`と`best-training.pt`は
+係数が最終値`0`に到達した評価だけから選ぶ。
+
+```bash
+caffeinate -i env PYTHONPATH=python .venv/bin/python \
+  -m examples.ahc015.python.train \
+  --config examples/ahc015/config_afterstate_no_phi.toml \
+  --resume outputs/ahc015/<parent-run>/best-training.pt
+```
+
+checkpointには係数とanneal累計時間を保存するため、中断後の再開では`1`からやり直さず、保存時点から
+scheduleを継続する。独立評価もcheckpointに保存された係数を自動的に使用する。
+
+今後の基準は`config_afterstate_alpha0.toml`である。方策は`alpha=0`を固定し、報酬には従来の
+`Phi(S_{t+1}) - Phi(S_t)`を残す。固定評価では不要なPhi-greedyを実行せず、同じ2,048ケースの
+平均公式スコアでbestを選ぶ。基準checkpointは
+`outputs/ahc015/small-20260830-091546/best-training.pt`である。
+
+```bash
+caffeinate -i env PYTHONPATH=python .venv/bin/python \
+  -m examples.ahc015.python.train \
+  --config examples/ahc015/config_afterstate_alpha0.toml \
+  --resume outputs/ahc015/small-20260830-091546/best-training.pt
+```
+
+`config_afterstate_terminal.toml`はpotential shapingも除いた不採用ablationを再現するために残す。
+10時間学習後は未使用5,000ケースで基準より18,189.576点低く、学習するほど固定評価も低下したため、
+このrunの学習後checkpointは採用しない。
+
 ## 検証
 
 ```bash
