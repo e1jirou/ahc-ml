@@ -17,6 +17,7 @@ from ahc_ml.seed import seed_everything
 from ahc_ml.tracking import WandbTracker
 from ahc_ml.visualization import render_model_graph
 
+from .afterstate_features import FUTURE_CHANNELS, FUTURE_LENGTH
 from .afterstate_model import AfterstatePpoNet
 from .afterstate_ppo import collect_afterstate_ppo_rollout, update_afterstate_ppo
 from .afterstate_simulation import evaluate_afterstate_policy
@@ -79,6 +80,7 @@ def evaluate(
         learned_kwargs = {"inference_batch_size": config.training.inference_batch_size}
         if config.model.input_mode == "afterstate":
             learned_kwargs["policy_phi_coefficient"] = policy_phi_coefficient
+            learned_kwargs["future_mode"] = config.model.future_mode
         learned_scores = policy_evaluator(
             evaluation_model,
             device,
@@ -139,7 +141,58 @@ def load_training_checkpoint(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> dict[str, object]:
-    return load_checkpoint(path, model=model, optimizer=optimizer, map_location=device)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    checkpoint_state = checkpoint["model_state_dict"]
+    incompatible = model.load_state_dict(checkpoint_state, strict=False)
+    allowed_missing = {
+        name
+        for name in model.state_dict()
+        if any(
+            module_name in name
+            for module_name in (
+                ".future_add.",
+                ".future_encoder.",
+                ".fusion.",
+                ".correction.",
+            )
+        )
+        and name not in checkpoint_state
+    }
+    if set(incompatible.missing_keys) != allowed_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "incompatible checkpoint state: "
+            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+        )
+
+    old_optimizer = checkpoint["optimizer_state_dict"]
+    old_parameter_ids = [
+        parameter_id
+        for group in old_optimizer["param_groups"]
+        for parameter_id in group["params"]
+    ]
+    old_parameter_names = list(checkpoint_state)
+    if len(old_parameter_ids) != len(old_parameter_names):
+        raise RuntimeError("checkpoint optimizer parameters do not match model parameters")
+    old_state_by_name = {
+        name: old_optimizer["state"].get(parameter_id, {})
+        for name, parameter_id in zip(old_parameter_names, old_parameter_ids, strict=True)
+    }
+    new_optimizer = optimizer.state_dict()
+    new_parameter_ids = [
+        parameter_id
+        for group in new_optimizer["param_groups"]
+        for parameter_id in group["params"]
+    ]
+    new_parameter_names = [name for name, _ in model.named_parameters()]
+    if len(new_parameter_ids) != len(new_parameter_names):
+        raise RuntimeError("optimizer parameters do not match model parameters")
+    new_optimizer["state"] = {
+        parameter_id: old_state_by_name[name]
+        for name, parameter_id in zip(new_parameter_names, new_parameter_ids, strict=True)
+        if name in old_state_by_name and old_state_by_name[name]
+    }
+    optimizer.load_state_dict(new_optimizer)
+    return checkpoint
 
 
 def apply_overrides(config: Ahc015Config, args: argparse.Namespace) -> Ahc015Config:
@@ -242,7 +295,11 @@ def main() -> None:
     )
 
     if config.model.input_mode == "afterstate":
-        model = AfterstatePpoNet(config.model.channels, config.model.residual_blocks)
+        model = AfterstatePpoNet(
+            config.model.channels,
+            config.model.residual_blocks,
+            config.model.future_mode,
+        )
         collect_rollout = collect_afterstate_ppo_rollout
         update_ppo = update_afterstate_ppo
     else:
@@ -250,12 +307,18 @@ def main() -> None:
         collect_rollout = collect_ppo_rollout
         update_ppo = ppo_update
     print(
-        f"model: {config.model.input_mode}, {config.model.channels} channels x "
-        f"{config.model.residual_blocks} blocks, {parameter_count(model.actor):,} actor parameters"
+        f"model: {config.model.input_mode}, future={config.model.future_mode}, "
+        f"{config.model.channels} channels x {config.model.residual_blocks} blocks, "
+        f"{parameter_count(model.actor):,} actor parameters"
+    )
+    graph_input_size: tuple[int, ...] | list[tuple[int, ...]] = (
+        [(1, BOARD_CHANNELS, SIDE, SIDE), (1, FUTURE_CHANNELS, FUTURE_LENGTH)]
+        if config.model.future_mode != "none"
+        else (1, BOARD_CHANNELS, SIDE, SIDE)
     )
     graph_svg, graph_png = render_model_graph(
         model.actor,
-        input_size=(1, BOARD_CHANNELS, SIDE, SIDE),
+        input_size=graph_input_size,
         output_stem=output_dir / "model-graph",
     )
     tracker.log_image(
@@ -369,6 +432,7 @@ def main() -> None:
         f"\n## {run_name}\n\n"
         f"- algorithm: PPO\n- status: started\n- output: `{output_dir}`\n"
         f"- input mode: {config.model.input_mode}\n"
+        f"- future mode: {config.model.future_mode}\n"
         f"- device: {device_info.selected} ({device_info.name})\n"
         f"- seed: {config.run.seed}\n"
         f"- wall-clock limit: {config.training.max_hours:.3f} hours\n"
@@ -403,6 +467,7 @@ def main() -> None:
             if config.model.input_mode == "afterstate":
                 collect_kwargs["policy_phi_coefficient"] = policy_phi_coefficient
                 collect_kwargs["reward_mode"] = config.ppo.reward_mode
+                collect_kwargs["future_mode"] = config.model.future_mode
             rollout, _, rollout_metrics = collect_rollout(
                 execution_model,
                 device,

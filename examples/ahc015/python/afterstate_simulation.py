@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from .afterstate_features import encode_afterstates
+from .afterstate_features import encode_afterstates, encode_future_sequences
 from .game import (
     ACTION_COUNT,
     CELL_COUNT,
@@ -25,8 +25,28 @@ def evaluate_afterstate_policy(
     *,
     inference_batch_size: int,
     policy_phi_coefficient: float = 1.0,
+    future_mode: str = "none",
+    future_ablation: str = "correct",
+    future_ablation_seed: int = 0,
 ) -> EvaluationResult:
+    if future_ablation not in {"correct", "off", "episode_shuffle", "order_shuffle"}:
+        raise ValueError(
+            "future_ablation must be correct, off, episode_shuffle, or order_shuffle"
+        )
+    if future_ablation != "correct" and future_mode != "full_late":
+        raise ValueError("future ablation requires full_late mode")
     episodes = len(flavors)
+    ablation_rng = np.random.default_rng(future_ablation_seed)
+    episode_permutation = (
+        ablation_rng.permutation(episodes)
+        if future_ablation == "episode_shuffle"
+        else None
+    )
+    order_priorities = (
+        ablation_rng.random((episodes, CELL_COUNT))
+        if future_ablation == "order_shuffle"
+        else None
+    )
     boards = np.zeros((episodes, SIDE, SIDE), dtype=np.uint8)
     score_denominators = np.asarray([denominator(row) for row in flavors])
     for turn in range(CELL_COUNT):
@@ -56,13 +76,45 @@ def evaluate_afterstate_policy(
                 turn + 1,
                 np.repeat(flavors, ACTION_COUNT, axis=0),
             )
+            future_features = (
+                encode_future_sequences(flavors, turn + 1)
+                if future_mode != "none" and future_ablation != "off"
+                else None
+            )
+            if future_features is not None and episode_permutation is not None:
+                future_features = future_features[episode_permutation]
+            if future_features is not None and order_priorities is not None:
+                start_position = turn + 1
+                remaining = future_features[:, :, start_position:]
+                order = np.argsort(order_priorities[:, start_position:], axis=1)
+                shuffled = np.take_along_axis(remaining, order[:, None, :], axis=2)
+                future_features = future_features.copy()
+                future_features[:, :, start_position:] = shuffled
+            flat_future_features = (
+                np.repeat(future_features, ACTION_COUNT, axis=0)
+                if future_features is not None
+                else None
+            )
             residuals = np.empty(episodes * ACTION_COUNT, dtype=np.float32)
             model.eval()
             with torch.inference_mode():
                 for start in range(0, len(flat_features), inference_batch_size):
                     stop = start + inference_batch_size
                     inputs = torch.from_numpy(flat_features[start:stop]).to(device)
-                    residuals[start:stop] = model(inputs).cpu().numpy()
+                    future_inputs = None
+                    if flat_future_features is not None:
+                        future_inputs = torch.from_numpy(flat_future_features[start:stop]).to(
+                            device=device, dtype=torch.float32
+                        )
+                    residuals[start:stop] = (
+                        model(
+                            inputs,
+                            future_inputs,
+                            use_future_correction=future_ablation != "off",
+                        )
+                        .cpu()
+                        .numpy()
+                    )
             residuals = residuals.reshape(episodes, ACTION_COUNT)
         if model is None:
             policy_values = candidate_potentials

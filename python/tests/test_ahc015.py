@@ -7,7 +7,12 @@ import pytest
 import torch
 
 from examples.ahc015.python import afterstate_ppo as afterstate_ppo_module
-from examples.ahc015.python.afterstate_features import encode_afterstates
+from examples.ahc015.python.afterstate_features import (
+    FUTURE_CHANNELS,
+    FUTURE_LENGTH,
+    encode_afterstates,
+    encode_future_sequences,
+)
 from examples.ahc015.python.afterstate_model import AfterstatePpoNet, AfterstateValueNet
 from examples.ahc015.python.afterstate_ppo import (
     AfterstatePpoRollout,
@@ -224,6 +229,20 @@ def test_config_and_ppo_model_shapes() -> None:
     assert alpha0_config.ppo.reward_mode == "potential_shaping"
     assert alpha0_config.ppo.gae_lambda == 0.95
     assert not alpha0_config.evaluation.phi_greedy_baseline
+    future_add_config = load_config(config_directory / "config_afterstate_future_add.toml")
+    assert future_add_config.run.seed == 15036
+    assert future_add_config.model.input_mode == "afterstate"
+    assert future_add_config.model.future_mode == "full_add"
+    assert future_add_config.model.channels == 64
+    assert future_add_config.training.max_hours == 10.0
+    assert future_add_config.wandb.mode == "online"
+    future_late_config = load_config(config_directory / "config_afterstate_future_late.toml")
+    assert future_late_config.run.seed == 15037
+    assert future_late_config.model.input_mode == "afterstate"
+    assert future_late_config.model.future_mode == "full_late"
+    assert future_late_config.model.channels == 64
+    assert future_late_config.training.max_hours == 10.0
+    assert future_late_config.wandb.mode == "online"
     terminal_config = load_config(config_directory / "config_afterstate_terminal.toml")
     assert terminal_config.run.seed == 15033
     assert terminal_config.model.channels == 64
@@ -358,6 +377,86 @@ def test_afterstate_policy_phi_coefficient_and_schedule() -> None:
     assert scheduled_policy_phi_coefficient(config.ppo, 8.0) == 0.0
 
 
+def test_full_future_encoding_and_zero_initialized_addition() -> None:
+    flavors = np.resize(np.array([3, 1, 2], dtype=np.uint8), CELL_COUNT)
+    placed = 7
+    future = encode_future_sequences(flavors, placed)
+    assert future.shape == (1, FUTURE_CHANNELS, FUTURE_LENGTH)
+    assert future.dtype == np.uint8
+    assert np.all(future[:, :, :placed] == 0)
+    assert np.all(future[:, :, placed:].sum(axis=1) == 1)
+    assert int(future.sum()) == CELL_COUNT - placed
+
+    torch.manual_seed(15035)
+    baseline = AfterstateValueNet().eval()
+    future_model = AfterstateValueNet(future_mode="full_add").eval()
+    incompatible = future_model.load_state_dict(baseline.state_dict(), strict=False)
+    assert set(incompatible.missing_keys) == {"future_add.weight", "future_add.bias"}
+    assert not incompatible.unexpected_keys
+    boards = torch.randn(2, BOARD_CHANNELS, SIDE, SIDE)
+    futures = torch.from_numpy(np.repeat(future, 2, axis=0)).float()
+    torch.nn.init.normal_(baseline.output.weight)
+    future_model.output.load_state_dict(baseline.output.state_dict())
+    with torch.inference_mode():
+        expected = baseline(boards)
+        actual = future_model(boards, futures)
+    assert torch.equal(actual, expected)
+
+    ppo_model = AfterstatePpoNet(future_mode="full_add").eval()
+    torch.nn.init.normal_(ppo_model.actor.future_add.weight, std=0.1)
+    torch.nn.init.normal_(ppo_model.actor.output.weight, std=0.1)
+    candidates = torch.randn(2, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
+    future_a = torch.zeros(2, FUTURE_CHANNELS, FUTURE_LENGTH)
+    future_b = torch.randn(2, FUTURE_CHANNELS, FUTURE_LENGTH)
+    with torch.inference_mode():
+        logits_a, _ = ppo_model(
+            candidates, None, 12.0, 0.0, future_inputs=future_a
+        )
+        logits_b, _ = ppo_model(
+            candidates, None, 12.0, 0.0, future_inputs=future_b
+        )
+    centered_a = logits_a - logits_a[:, :1]
+    centered_b = logits_b - logits_b[:, :1]
+    assert not torch.allclose(centered_a, centered_b)
+
+
+def test_full_future_late_fusion_is_residual_and_action_dependent() -> None:
+    torch.manual_seed(15037)
+    baseline = AfterstateValueNet().eval()
+    late_model = AfterstateValueNet(future_mode="full_late").eval()
+    incompatible = late_model.load_state_dict(baseline.state_dict(), strict=False)
+    assert set(incompatible.missing_keys) == {
+        "future_encoder.weight",
+        "future_encoder.bias",
+        "fusion.weight",
+        "fusion.bias",
+        "correction.weight",
+        "correction.bias",
+    }
+    assert not incompatible.unexpected_keys
+    boards = torch.randn(8, BOARD_CHANNELS, SIDE, SIDE)
+    futures = torch.randn(8, FUTURE_CHANNELS, FUTURE_LENGTH)
+    torch.nn.init.normal_(baseline.output.weight)
+    late_model.output.load_state_dict(baseline.output.state_dict())
+    with torch.inference_mode():
+        expected = baseline(boards)
+        actual = late_model(boards, futures)
+    assert torch.equal(actual, expected)
+
+    torch.nn.init.normal_(late_model.correction.weight, std=0.1)
+    with torch.inference_mode():
+        future_a = torch.zeros_like(futures)
+        future_b = torch.randn_like(futures)
+        scores_a = late_model(boards, future_a)
+        scores_b = late_model(boards, future_b)
+        correction_off = late_model(
+            boards,
+            use_future_correction=False,
+        )
+    assert not torch.allclose(scores_a, scores_b)
+    assert torch.equal(correction_off, expected)
+
+
 def test_afterstate_rollout_smoke() -> None:
     rollout, result, metrics = collect_afterstate_ppo_rollout(
         AfterstatePpoNet(),
@@ -382,6 +481,20 @@ def test_afterstate_rollout_smoke() -> None:
     assert np.all(np.isfinite(rollout.advantages))
     assert np.all((result.potentials >= 0) & (result.potentials <= 1))
     assert metrics["rollout/mean_score"] > 0
+
+    future_rollout, _, _ = collect_afterstate_ppo_rollout(
+        AfterstatePpoNet(future_mode="full_add"),
+        torch.device("cpu"),
+        episodes=1,
+        rng=np.random.default_rng(15035),
+        gamma=1.0,
+        gae_lambda=0.95,
+        logit_scale=12.0,
+        inference_batch_size=4,
+        future_mode="full_add",
+    )
+    assert future_rollout.future_features is not None
+    assert future_rollout.future_features.shape == (99, FUTURE_CHANNELS, FUTURE_LENGTH)
 
 
 def test_afterstate_rollout_and_update_with_only_final_phi(
@@ -422,6 +535,7 @@ def test_afterstate_rollout_and_update_with_only_final_phi(
     size = 2
     short_rollout = AfterstatePpoRollout(
         board_features=rollout.board_features[:size],
+        future_features=None,
         candidate_potentials=None,
         actions=rollout.actions[:size],
         old_log_probs=rollout.old_log_probs[:size],

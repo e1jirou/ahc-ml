@@ -142,7 +142,10 @@ def main() -> None:
             output_size = checkpoint["model_state_dict"]["output.weight"].shape[0]
             input_mode = "afterstate" if output_size == 1 else "pretilt"
         if input_mode == "afterstate":
-            model = AfterstateValueNet(channels, residual_blocks).to(device)
+            future_mode = (
+                checkpoint.get("config", {}).get("model", {}).get("future_mode", "none")
+            )
+            model = AfterstateValueNet(channels, residual_blocks, future_mode).to(device)
             learned_evaluator = evaluate_afterstate_policy
         else:
             model = Ahc015ValueNet(channels, residual_blocks).to(device)
@@ -158,6 +161,7 @@ def main() -> None:
                     checkpoint_ppo.get("policy_phi_coefficient_start", 1.0),
                 )
             )
+            learned_kwargs["future_mode"] = future_mode
         learned = learned_evaluator(
             model,
             device,

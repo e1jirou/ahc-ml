@@ -1160,3 +1160,184 @@
   `Phi(S_{t+1}) - Phi(S_t)`のpotential shapingを残す。今後の基準は
   `outputs/ahc015/small-20260830-091546/best-training.pt`へ戻し、標準configを
   `examples/ahc015/config_afterstate_alpha0.toml`とする
+
+## 2026-08-31 full未来列＋pooled加算・5時間（準備）
+
+- 目的: 64 channelのafterstateモデルで、既知の未来列を欠落なく与えた場合の上積みを調べる
+- 継続元: `outputs/ahc015/small-20260830-091546/best-training.pt`（64 channel・10 block、
+  policy `alpha=0`、potential shaping）
+- 未来列: 各ターンの未配置部分を、盤面と同じdynamic flavor mappingでcanonical化する。3種類×全100位置の
+  one-hotを使用し、配置済み位置だけを0にする。要約統計への置換や切り詰めは行わない
+- 結合: `3 x 100`を単一の線形層で64次元へ射影し、residual CNNのglobal average pooling後の
+  64次元盤面表現へ加算する。actorとcriticに同じ構成を使う
+- 初期化・継続: 加算層のweightとbiasを0初期化し、開始時のactor・critic出力を継続元と完全一致させる。
+  既存parameterのAdamW stateは名前対応で引き継ぎ、新規加算層だけstateなしから開始する
+- rollout: 同一ターンの4候補で未来列は共通なので、`uint8`の未来列を1 transitionにつき1つ保存する
+- 比較条件: rollout 4,096局、1 epoch、固定評価2,048ケースを2 iterationごと、時間5時間。
+  policy `alpha=0`とpotential shapingは基準から変更しない
+- config: `examples/ahc015/config_afterstate_future_add.toml`
+- seed: `15035`、device: MPS、W&B: online
+
+## small-20260831-142105
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260831-142105`
+- input mode: afterstate
+- future mode: full_add
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15035
+- wall-clock limit: 5.000 hours
+- policy Phi coefficient: 0 -> 0 over 0 hours
+- reward mode: potential_shaping
+- Phi-greedy evaluation: False
+- W&B: online, run ID `ns6puj4v`
+- status: time limit reached
+- elapsed: 5.103 hours
+- updates: 111672
+- best mean score: 783137.628
+- 完走確認: 5.103時間、iteration 237から281まで45 iteration、18,247,680 transitionと17,820 updateを
+  追加した。固定2,048ケースbestはiteration 279の783,137.628で、継続元778,415.444より
+  +4,722.184点。最初5評価平均778,550.264、最後5評価平均780,121.505だった
+- 問題: pooled盤面表現`b`と4候補で共通の未来表現`f`を加算した直後が1出力の線形層なので、
+  `w(b + f) = wb + wf`となる。`wf`は全候補logitに共通の定数であり、softmaxとargmaxで相殺される。
+  実checkpointでも未来入力を変えて選択行動は変化しなかった。criticは未来列を利用できるが、actorは
+  行動選択に利用できない
+- 判断: スコア上昇は盤面経路の追加学習または未来対応criticの効果と分離できず、未来列の結合実験としては
+  無効なので継続しない
+
+## 2026-08-31 full未来列＋stem加算・10時間（準備）
+
+- 継続元: `outputs/ahc015/small-20260830-091546/best-training.pt`。上記pooled加算runからは継続しない
+- 結合: `3 x 100`のfull未来列を単一の線形層`300 -> 64`で射影し、CNN stem直後のfeature mapへ
+  broadcast加算してから10個の非線形residual blockへ通す。候補盤面と未来列の相互作用を可能にしつつ、
+  FiLMのscaleや中間MLPはまだ導入しない
+- 初期化: 射影のweightとbiasを0初期化するため、開始時のactor・criticは継続元と完全一致する。
+  既存AdamW stateも名前対応で引き継ぐ
+- 比較条件: rollout 4,096局、1 epoch、固定評価2,048ケースを2 iterationごと、時間10時間。
+  policy `alpha=0`、potential shaping、64 channel・10 blockは変更しない
+- config: `examples/ahc015/config_afterstate_future_add.toml`
+- seed: `15036`、device: MPS、W&B: online
+
+## small-20260831-230806
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260831-230806`
+- input mode: afterstate
+- future mode: full_add
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15036
+- wall-clock limit: 10.000 hours
+- policy Phi coefficient: 0 -> 0 over 0 hours
+- reward mode: potential_shaping
+- Phi-greedy evaluation: False
+- W&B: online, run ID `bz8nzt5t`
+- status: time limit reached
+- elapsed: 10.015 hours
+- updates: 128304
+- best mean score: 780156.013
+- 完走確認: 10.015時間、iteration 237から323まで87 iteration、35,225,344 transitionと34,452 updateを
+  追加した。explained variance平均0.9800、KL平均0.00693、early stopは0回で学習は安定していた
+- 固定2,048ケース: 継続元778,415.444に対しbestはiteration 307（8.175時間）の780,156.013で
+  +1,740.569点。44評価中で継続元を上回ったのは4回、最初5評価平均774,565.044、最後5評価平均
+  777,013.928だった。開始後に一度悪化し、8時間付近で基準水準まで回復した
+- 独立評価: 学習・best選択に未使用の2,000ケース、seed `20260901`。継続元は776,726.156、
+  stem加算bestは780,881.024。同一ケース差は+4,154.869 ±2,531.711、stem加算版の勝率50.55%、
+  同率0.40%。改善方向だが約1.64標準誤差で、採用確定には弱い
+- 判断: actorの未来射影weight normはbest時4.536まで増え、未来経路は学習された。一方で序盤悪化と
+  固定評価の不安定さがあり、stemへの直接注入は盤面表現へ干渉している可能性がある。単純継続より、
+  既存盤面scoreを残す残差late fusionと比較する
+
+## 2026-09-01 full未来列＋残差late fusion・10時間（準備）
+
+- 継続元: `outputs/ahc015/small-20260830-091546/best-training.pt`。stem加算runからは継続せず、
+  同じ未来列なし基準から分岐する
+- 結合: 盤面CNNのglobal average pooling後の64次元`b`と、full未来列を`300 -> 64`とReLUで
+  符号化した`f`をconcatする。`128 -> 64 -> 1`とReLUの小さなMLPで補正`delta(b, f)`を生成し、
+  既存の`output(b)`へ加算する。盤面と未来の非線形な相互作用を持つため、共通logit相殺は起きない
+- 初期化: 補正MLPの最終`64 -> 1`をゼロ初期化し、開始時のactor・critic出力を継続元と完全一致させる。
+  既存parameterのAdamW stateは名前対応で引き継ぎ、新規parameterだけstateなしから開始する
+- 比較条件: 64 channel・10 block、rollout 4,096局、1 epoch、固定評価2,048ケースを2 iterationごと、
+  policy `alpha=0`、potential shaping、時間10時間
+- config: `examples/ahc015/config_afterstate_future_late.toml`
+- seed: `15037`、device: MPS、W&B: online
+
+## small-20260901-103739
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260901-103739`
+- input mode: afterstate
+- future mode: full_late
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15037
+- wall-clock limit: 10.000 hours
+- policy Phi coefficient: 0 -> 0 over 0 hours
+- reward mode: potential_shaping
+- Phi-greedy evaluation: False
+- W&B: online, run ID `zxf2veg1`
+- status: time limit reached
+- elapsed: 10.116 hours
+- updates: 129096
+- best mean score: 784952.930
+
+## small-20260901-233428
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260901-233428`
+- input mode: afterstate
+- future mode: full_late
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15038
+- wall-clock limit: 10.000 hours
+- policy Phi coefficient: 0 -> 0 over 0 hours
+- reward mode: potential_shaping
+- Phi-greedy evaluation: False
+- W&B: online, run ID `2rjfla17`
+- status: time limit reached
+- elapsed: 10.045 hours
+- updates: 160776
+- best mean score: 788386.353
+
+## small-20260902-102642
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260902-102642`
+- input mode: afterstate
+- future mode: full_late
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15039
+- wall-clock limit: 10.000 hours
+- policy Phi coefficient: 0 -> 0 over 0 hours
+- reward mode: potential_shaping
+- Phi-greedy evaluation: False
+- W&B: online, run ID `8vwhuzf0`
+- status: time limit reached
+- elapsed: 10.016 hours
+- updates: 191664
+- best mean score: 790087.528
+- 完走確認: 10.016時間、iteration 397から483まで87 iteration。固定2,048ケースbestは
+  iteration 457（7.059時間）の790,087.528で、未来列なし基準778,415.444より+11,672.084点。
+  最初5評価平均784,603.328、最後5評価平均786,972.077で、3回の10時間runにおけるbestの増分は
+  +6,537、+3,433、+1,701点と縮小したため、概ね飽和と判断した
+
+## 2026-09-03 full未来列ablation・5,000ケース
+
+- 対象: `outputs/ahc015/small-20260902-102642/best.pt`（full未来列＋残差late fusion、iteration 457）
+- 基準: `outputs/ahc015/small-20260830-091546/best.pt`（未来列なし）
+- ケース: 学習・best選択・過去の独立評価に未使用の5,000ケース、seed `20260903`
+- 条件: 正しい未来列、未来補正`delta`完全OFF、episode間で未来列を入れ替え、各局・各ターンの
+  残数を保って未来順だけをshuffle。5条件をCPU 5 process・各2 threadで並列評価し、約32分を要した
+- 未来列なし基準: 778,954.653
+- 正しい未来列: 787,086.924。基準差+8,132.270 ±1,513.728、勝率53.78%、同率0.32%
+- 補正OFF: 787,450.627。正しい未来列との差+363.703 ±365.903、同率92.82%。点推定では
+  正しい未来列より高いが、約0.99標準誤差で有意ではない
+- episode shuffle: 787,226.237。正しい未来列との差+139.314 ±180.659、同率98.42%
+- 順序shuffle: 787,119.295。正しい未来列との差+32.372 ±183.067、同率98.14%
+- 判断: 学習済みlate fusionモデル自体は未来列なし基準を明確に上回るが、補正を無効化した方が点推定で
+  さらに高く、正しい未来列は誤った未来列や順序を壊した未来列を上回らなかった。改善の大半は30時間の
+  追加学習を受けた共有CNN・既存headによるもので、現在の補正MLPが未来情報を有益に利用した証拠はない。
+  full未来列の表現を否定する結果ではなく、盤面だけでも表現できる補正MLPへ依存した結合方式の問題とみる

@@ -37,6 +37,7 @@ class ModelConfig:
     channels: int
     residual_blocks: int
     input_mode: str = "pretilt"
+    future_mode: str = "none"
 
 
 @dataclass(frozen=True)
@@ -129,6 +130,10 @@ def load_config(path: str | Path) -> Ahc015Config:
         raise ValueError("training.rollout_processes must be 1 or 2")
     if config.model.input_mode not in {"pretilt", "afterstate"}:
         raise ValueError("model.input_mode must be pretilt or afterstate")
+    if config.model.future_mode not in {"none", "full_add", "full_late"}:
+        raise ValueError("model.future_mode must be none, full_add, or full_late")
+    if config.model.future_mode != "none" and config.model.input_mode != "afterstate":
+        raise ValueError("future inputs currently support only afterstate input")
     if config.ppo.gamma != 1.0:
         raise ValueError("ppo.gamma must be 1.0 so potential shaping preserves the objective")
     if not 0 < config.ppo.gae_lambda <= 1:

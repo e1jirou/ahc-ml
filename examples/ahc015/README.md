@@ -90,6 +90,15 @@ caffeinate -i env PYTHONPATH=python .venv/bin/python \
 10時間学習後は未使用5,000ケースで基準より18,189.576点低く、学習するほど固定評価も低下したため、
 このrunの学習後checkpointは採用しない。
 
+full未来列＋加算の実験には`config_afterstate_future_add.toml`を使う。未配置のcanonical味列を
+`(3, 100)`のone-hotで欠落なく入力し、線形射影した64次元をCNN stem直後へbroadcast加算する。
+後続の非線形residual blockにより、未来列と各候補盤面の相互作用を表現できる。
+加算層はゼロ初期化されるため、上記基準checkpointからの開始時点では方策と価値が一致する。
+
+full未来列＋残差late fusionの実験には`config_afterstate_future_late.toml`を使う。盤面CNNの
+pooled 64次元と`300 -> 64`で符号化した未来列をconcatし、`128 -> 64 -> 1`のMLPが既存scoreへの
+補正値だけを生成する。補正の最終層はゼロ初期化され、基準の盤面経路を開始時に変更しない。
+
 ## 検証
 
 ```bash
