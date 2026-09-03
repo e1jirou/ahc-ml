@@ -131,10 +131,14 @@ def collect_afterstate_ppo_rollout(
         probabilities = np.empty((episodes, ACTION_COUNT), dtype=np.float32)
         values_array = np.empty(episodes, dtype=np.float32)
         episode_batch_size = max(1, inference_batch_size // ACTION_COUNT)
-        with torch.inference_mode():
+        # DataParallel worker threads do not reliably inherit inference-mode state.
+        # no_grad provides the same memory saving here and is safe on CUDA replicas.
+        with torch.no_grad():
             for start in range(0, episodes, episode_batch_size):
                 stop = min(start + episode_batch_size, episodes)
-                board_tensor = torch.from_numpy(board_features[start:stop]).to(device)
+                board_tensor = torch.from_numpy(board_features[start:stop]).to(
+                    device=device, dtype=torch.float32
+                )
                 potential_tensor = (
                     torch.from_numpy(candidate_potentials[start:stop]).to(device)
                     if candidate_potentials is not None

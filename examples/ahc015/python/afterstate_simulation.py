@@ -97,10 +97,13 @@ def evaluate_afterstate_policy(
             )
             residuals = np.empty(episodes * ACTION_COUNT, dtype=np.float32)
             model.eval()
-            with torch.inference_mode():
+            # DataParallel worker threads do not reliably inherit inference-mode state.
+            with torch.no_grad():
                 for start in range(0, len(flat_features), inference_batch_size):
                     stop = start + inference_batch_size
-                    inputs = torch.from_numpy(flat_features[start:stop]).to(device)
+                    inputs = torch.from_numpy(flat_features[start:stop]).to(
+                        device=device, dtype=torch.float32
+                    )
                     future_inputs = None
                     if flat_future_features is not None:
                         future_inputs = torch.from_numpy(flat_future_features[start:stop]).to(
