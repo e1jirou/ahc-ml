@@ -75,7 +75,7 @@ from examples.ahc015.python.ppo import (
     ppo_update,
 )
 from examples.ahc015.python.simulation import evaluate_policy, generate_cases
-from examples.ahc015.python.train import scheduled_policy_phi_coefficient
+from examples.ahc015.python.train import scheduled_coefficient, scheduled_policy_phi_coefficient
 
 
 def test_tilts_compact_without_reordering() -> None:
@@ -223,6 +223,13 @@ def test_config_and_ppo_model_shapes() -> None:
     assert afterstate_config.model.residual_blocks == 10
     assert afterstate_config.training.max_hours == 5.0
     assert afterstate_config.evaluation.interval == 2
+    distill_config = load_config(config_directory / "config_afterstate_128_distill.toml")
+    assert distill_config.model.future_mode == "none"
+    assert distill_config.model.channels == 128
+    assert distill_config.training.learning_rate == 1e-4
+    assert distill_config.distillation.coefficient_start == 1.0
+    assert distill_config.distillation.coefficient_end == 0.0
+    assert distill_config.distillation.anneal_hours == 3.0
     assert afterstate_config.evaluation.episodes == 2048
     no_phi_config = load_config(config_directory / "config_afterstate_no_phi.toml")
     assert no_phi_config.run.seed == 15031
@@ -336,6 +343,56 @@ def test_config_and_ppo_model_shapes() -> None:
     assert torch.equal(values, torch.zeros(2))
 
 
+def test_distillation_schedule_and_actor_kl() -> None:
+    assert scheduled_coefficient(1.0, 0.0, 3.0, 0.0) == 1.0
+    assert scheduled_coefficient(1.0, 0.0, 3.0, 1.5) == 0.5
+    assert scheduled_coefficient(1.0, 0.0, 3.0, 4.0) == 0.0
+
+    torch.manual_seed(15041)
+    student = AfterstatePpoNet(channels=8, residual_blocks=1)
+    teacher = AfterstateValueNet(channels=4, residual_blocks=1)
+    torch.nn.init.normal_(teacher.output.weight, std=0.1)
+    teacher.requires_grad_(False)
+    rng = np.random.default_rng(15041)
+    size = 2
+    rollout = AfterstatePpoRollout(
+        board_features=rng.integers(
+            0, 2, size=(size, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE), dtype=np.uint8
+        ),
+        future_features=None,
+        candidate_potentials=None,
+        actions=np.asarray([0, 1], dtype=np.int64),
+        old_log_probs=np.full(size, -np.log(ACTION_COUNT), dtype=np.float32),
+        old_values=np.zeros(size, dtype=np.float32),
+        advantages=np.asarray([1.0, -1.0], dtype=np.float32),
+        returns=np.asarray([0.2, 0.4], dtype=np.float32),
+    )
+    optimizer = torch.optim.AdamW(student.parameters(), lr=1e-4)
+    metrics = update_afterstate_ppo(
+        student,
+        optimizer,
+        rollout,
+        torch.device("cpu"),
+        rng,
+        epochs=1,
+        batch_size=size,
+        micro_batch_size=1,
+        clip_ratio=0.2,
+        value_clip=0.2,
+        value_coefficient=0.5,
+        entropy_coefficient=0.003,
+        gradient_clip_norm=1.0,
+        logit_scale=12.0,
+        target_kl=0.03,
+        policy_phi_coefficient=0.0,
+        teacher_actor=teacher,
+        distillation_coefficient=1.0,
+    )
+    assert metrics["training/distillation_kl"] > 0
+    assert metrics["training/distillation_coefficient"] == 1.0
+    assert all(parameter.grad is None for parameter in teacher.parameters())
+
+
 def test_zero_actor_is_exact_phi_greedy_after_normalization() -> None:
     flavors, ranks = generate_cases(4, 15029)
     device = torch.device("cpu")
@@ -432,12 +489,8 @@ def test_full_future_encoding_and_zero_initialized_addition() -> None:
     future_a = torch.zeros(2, FUTURE_CHANNELS, FUTURE_LENGTH)
     future_b = torch.randn(2, FUTURE_CHANNELS, FUTURE_LENGTH)
     with torch.inference_mode():
-        logits_a, _ = ppo_model(
-            candidates, None, 12.0, 0.0, future_inputs=future_a
-        )
-        logits_b, _ = ppo_model(
-            candidates, None, 12.0, 0.0, future_inputs=future_b
-        )
+        logits_a, _ = ppo_model(candidates, None, 12.0, 0.0, future_inputs=future_a)
+        logits_b, _ = ppo_model(candidates, None, 12.0, 0.0, future_inputs=future_b)
     centered_a = logits_a - logits_a[:, :1]
     centered_b = logits_b - logits_b[:, :1]
     assert not torch.allclose(centered_a, centered_b)

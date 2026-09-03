@@ -1400,3 +1400,19 @@
 - 判断: 正しい未来列はepisode shuffleや順序shuffleを上回らず、全ゼロとの差も約0.95標準誤差に
   とどまった。旧大型モデルでも正しい未来順をスコア改善へ利用した証拠はなく、現在の128 channel実験では
   未来列なしを維持する。数百点程度の小さな効果までは否定しない
+
+## 2026-09-03 未来列なし128 channel・ランダム初期化＋方策蒸留（準備）
+
+- 方針: 今後、特別な指定がない限り未来列を入力特徴へ含めない
+- student: afterstate、canonical味3面＋空きマス1面、128 channel・10 block。完全ランダム初期化
+  （既存モデル実装どおりactor/critic最終headのみ0初期化）し、wideningやoptimizer stateは使わない
+- teacher: `small-20260902-102642/best-training.pt`の64 channel actorからfuture encoder・fusion・
+  correctionを捨てた盤面経路（iteration 457、5,000ケースの補正OFF平均787,450.627）。teacherにも
+  future入力を渡さず、criticは教師にしない
+- 補助損失: 4候補に対する`KL(teacher || student)`。係数を実時間3時間で`1 -> 0`へ線形減衰する
+- PPO: potential shapingを維持し、policy Phi係数は`alpha=0`。学習率`1e-4`、entropy係数`0.003`
+- 実行: Kaggle T4 x2、DataParallel、rollout 4,096局、minibatch 1,024、microbatch 512、固定評価
+  2,048ケース/2 iteration、W&B online、seed `15041`、3時間
+- Notebook: `examples/ahc015/ahc015-128-distillation.ipynb`
+- 次段階: このrunの`best-training.pt`から蒸留係数0で17時間PPOを継続し、状況確認後にbestから
+  さらに10時間継続する

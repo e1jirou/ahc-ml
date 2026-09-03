@@ -57,6 +57,13 @@ class PpoConfig:
 
 
 @dataclass(frozen=True)
+class DistillationConfig:
+    coefficient_start: float = 0.0
+    coefficient_end: float = 0.0
+    anneal_hours: float = 0.0
+
+
+@dataclass(frozen=True)
 class EvaluationConfig:
     interval: int
     episodes: int
@@ -77,6 +84,7 @@ class Ahc015Config:
     model: ModelConfig
     training: TrainingConfig
     ppo: PpoConfig
+    distillation: DistillationConfig
     evaluation: EvaluationConfig
     wandb: WandbConfig
 
@@ -97,6 +105,7 @@ def load_config(path: str | Path) -> Ahc015Config:
         model=ModelConfig(**values.get("model", {"channels": 64, "residual_blocks": 10})),
         training=TrainingConfig(**values["training"]),
         ppo=PpoConfig(**values["ppo"]),
+        distillation=DistillationConfig(**values.get("distillation", {})),
         evaluation=EvaluationConfig(**values["evaluation"]),
         wandb=WandbConfig(**values["wandb"]),
     )
@@ -147,13 +156,23 @@ def load_config(path: str | Path) -> Ahc015Config:
     if config.ppo.policy_phi_anneal_hours < 0:
         raise ValueError("ppo.policy_phi_anneal_hours must be non-negative")
     if (
-        config.ppo.policy_phi_coefficient_start
-        != config.ppo.policy_phi_coefficient_end
+        config.ppo.policy_phi_coefficient_start != config.ppo.policy_phi_coefficient_end
         and config.ppo.policy_phi_anneal_hours == 0
     ):
         raise ValueError("ppo.policy_phi_anneal_hours must be positive when coefficients differ")
     if config.ppo.reward_mode not in {"potential_shaping", "terminal"}:
         raise ValueError("ppo.reward_mode must be potential_shaping or terminal")
+    if config.distillation.coefficient_start < 0:
+        raise ValueError("distillation.coefficient_start must be non-negative")
+    if config.distillation.coefficient_end < 0:
+        raise ValueError("distillation.coefficient_end must be non-negative")
+    if config.distillation.anneal_hours < 0:
+        raise ValueError("distillation.anneal_hours must be non-negative")
+    if (
+        config.distillation.coefficient_start != config.distillation.coefficient_end
+        and config.distillation.anneal_hours == 0
+    ):
+        raise ValueError("distillation.anneal_hours must be positive when coefficients differ")
     if config.ppo.reward_mode == "terminal":
         if config.model.input_mode != "afterstate":
             raise ValueError("terminal reward mode currently supports only afterstate input")

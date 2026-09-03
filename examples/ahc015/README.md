@@ -118,6 +118,18 @@ caffeinate -i env PYTHONPATH=python .venv/bin/python \
 64 channel教師相当の初期方策は失われない。`--initialize-from`と、学習状態を丸ごと再開する
 `--resume`は同時には指定できない。
 
+### ランダム初期化＋方策蒸留
+
+今後は特別な指定がない限り未来列を入力しない。提出用128 channelモデルを0から作る第一段階には
+`ahc015-128-distillation.ipynb`を使う。studentはランダム初期化し、64 channel・未来列なし教師の
+actor分布に対する`KL(teacher || student)`だけを補助損失へ加える。criticは蒸留しない。係数は
+実時間3時間で`1`から`0`へ線形減衰し、PPOのpotential shapingとpolicy `alpha=0`は維持する。
+
+NotebookはKaggle T4 x2、W&B online用であり、`config_afterstate_128_distill.toml`を実行する。
+教師checkpointはW&B run `small-20260902-102642`の64 channel bestからfuture encoder・fusion・
+correctionを除いた盤面経路である。future入力は生成も使用もしない。この経路の5,000ケースablation
+平均は787,450.627だった。3時間終了後の`best-training.pt`を次の蒸留なし17時間PPOの開始点に使う。
+
 ## 旧モデルの未来列ablation
 
 64 channel化以前の144 channel・9 blockモデルが未来列を実際に利用していたかは、当時の15盤面特徴、

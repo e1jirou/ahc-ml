@@ -114,9 +114,7 @@ def collect_afterstate_ppo_rollout(
         )
         board_features = flat_features.reshape(episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
         future_features = (
-            encode_future_sequences(flavors, turn + 1)
-            if future_storage is not None
-            else None
+            encode_future_sequences(flavors, turn + 1) if future_storage is not None else None
         )
         candidate_potentials = None
         if policy_phi_coefficient != 0.0:
@@ -254,11 +252,17 @@ def update_afterstate_ppo(
     target_kl: float,
     micro_batch_size: int | None = None,
     policy_phi_coefficient: float = 1.0,
+    teacher_actor: torch.nn.Module | None = None,
+    distillation_coefficient: float = 0.0,
 ) -> dict[str, float]:
     if micro_batch_size is None:
         micro_batch_size = batch_size
     if micro_batch_size <= 0 or micro_batch_size > batch_size:
         raise ValueError("micro_batch_size must be in [1, batch_size]")
+    if distillation_coefficient < 0:
+        raise ValueError("distillation_coefficient must be non-negative")
+    if distillation_coefficient > 0 and teacher_actor is None:
+        raise ValueError("teacher_actor is required when distillation is enabled")
     advantages = rollout.advantages.copy()
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     metric_rows: dict[str, list[float]] = {
@@ -271,6 +275,7 @@ def update_afterstate_ppo(
             "kl",
             "clip_fraction",
             "gradient_norm",
+            "distillation_kl",
         )
     }
     updates = 0
@@ -284,7 +289,15 @@ def update_afterstate_ppo(
             optimizer.zero_grad(set_to_none=True)
             batch_metrics = {
                 name: torch.zeros((), device=device)
-                for name in ("loss", "policy_loss", "value_loss", "entropy", "kl", "clip_fraction")
+                for name in (
+                    "loss",
+                    "policy_loss",
+                    "value_loss",
+                    "entropy",
+                    "kl",
+                    "clip_fraction",
+                    "distillation_kl",
+                )
             }
             for micro_start in range(0, len(batch_indices), micro_batch_size):
                 micro_indices = batch_indices[micro_start : micro_start + micro_batch_size]
@@ -333,7 +346,25 @@ def update_afterstate_ppo(
                     ).mean()
                 )
                 entropy = distribution.entropy().mean()
-                loss = policy_loss + value_coefficient * value_loss - entropy_coefficient * entropy
+                distillation_kl = torch.zeros((), device=device)
+                if teacher_actor is not None and distillation_coefficient > 0:
+                    batch_length, action_count = boards.shape[:2]
+                    with torch.no_grad():
+                        teacher_values = teacher_actor(boards.flatten(0, 1)).reshape(
+                            batch_length, action_count
+                        )
+                        teacher_log_probs = torch.log_softmax(logit_scale * teacher_values, dim=1)
+                        teacher_probs = teacher_log_probs.exp()
+                    student_log_probs = torch.log_softmax(logits, dim=1)
+                    distillation_kl = (
+                        (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=1).mean()
+                    )
+                loss = (
+                    policy_loss
+                    + value_coefficient * value_loss
+                    - entropy_coefficient * entropy
+                    + distillation_coefficient * distillation_kl
+                )
                 (loss * weight).backward()
                 with torch.no_grad():
                     approximate_kl = ((ratio - 1) - log_ratio).mean()
@@ -345,6 +376,7 @@ def update_afterstate_ppo(
                     ("entropy", entropy),
                     ("kl", approximate_kl),
                     ("clip_fraction", clip_fraction),
+                    ("distillation_kl", distillation_kl),
                 ):
                     batch_metrics[name] += value.detach() * weight
 
@@ -367,6 +399,8 @@ def update_afterstate_ppo(
         "training/approximate_kl": float(np.mean(metric_rows["kl"])),
         "training/clip_fraction": float(np.mean(metric_rows["clip_fraction"])),
         "training/gradient_norm": float(np.mean(metric_rows["gradient_norm"])),
+        "training/distillation_kl": float(np.mean(metric_rows["distillation_kl"])),
+        "training/distillation_coefficient": distillation_coefficient,
         "training/updates_this_iteration": float(updates),
         "training/early_stop": float(stopped_early),
         "training/explained_variance": float(

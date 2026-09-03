@@ -18,13 +18,17 @@ from ahc_ml.tracking import WandbTracker
 from ahc_ml.visualization import render_model_graph
 
 from .afterstate_features import FUTURE_CHANNELS, FUTURE_LENGTH
-from .afterstate_model import AfterstatePpoNet, initialize_widened_afterstate_ppo
+from .afterstate_model import (
+    AfterstatePpoNet,
+    AfterstateValueNet,
+    initialize_widened_afterstate_ppo,
+)
 from .afterstate_ppo import collect_afterstate_ppo_rollout, update_afterstate_ppo
 from .afterstate_simulation import evaluate_afterstate_policy
 from .config import Ahc015Config, PpoConfig, load_config
 from .features import BOARD_CHANNELS
 from .game import SIDE
-from .model import Ahc015PpoNet, parameter_count
+from .model import Ahc015PpoNet, dimensions_from_state_dict, parameter_count
 from .parallel_runtime import ParallelAhc015Runtime
 from .ppo import collect_ppo_rollout, ppo_update
 from .simulation import evaluate_policy, generate_cases
@@ -57,6 +61,11 @@ def parse_args() -> argparse.Namespace:
         "--initialize-from",
         type=Path,
         help="initialize a 2x-wider afterstate model from a full PPO checkpoint",
+    )
+    parser.add_argument(
+        "--distill-from",
+        type=Path,
+        help="add actor KL distillation from an afterstate PPO training checkpoint",
     )
     return parser.parse_args()
 
@@ -111,9 +120,7 @@ def evaluate(
         )
     metrics = {
         "evaluation/mean_score": float(learned_scores.mean()),
-        "evaluation/score_se": float(
-            learned_scores.std(ddof=1) / math.sqrt(len(learned_scores))
-        ),
+        "evaluation/score_se": float(learned_scores.std(ddof=1) / math.sqrt(len(learned_scores))),
     }
     if greedy_scores is not None:
         difference = learned_scores - greedy_scores
@@ -138,6 +145,40 @@ def scheduled_policy_phi_coefficient(config: PpoConfig, elapsed_hours: float) ->
         config.policy_phi_coefficient_start
         + (config.policy_phi_coefficient_end - config.policy_phi_coefficient_start) * progress
     )
+
+
+def scheduled_coefficient(
+    start: float, end: float, anneal_hours: float, elapsed_hours: float
+) -> float:
+    if anneal_hours == 0:
+        return end
+    progress = min(max(elapsed_hours / anneal_hours, 0.0), 1.0)
+    return start + (end - start) * progress
+
+
+def load_distillation_teacher(path: Path) -> AfterstateValueNet:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    source_model_config = checkpoint.get("config", {}).get("model", {})
+    if source_model_config.get("input_mode", "afterstate") != "afterstate":
+        raise ValueError("distillation teacher must use afterstate input")
+    state = checkpoint["model_state_dict"]
+    actor_state = {
+        name.removeprefix("actor."): value
+        for name, value in state.items()
+        if name.startswith("actor.")
+        and not any(
+            part in name
+            for part in (".future_add.", ".future_encoder.", ".fusion.", ".correction.")
+        )
+    }
+    if not actor_state:
+        raise ValueError("distillation checkpoint must contain a full PPO actor")
+    channels, residual_blocks = dimensions_from_state_dict(state, prefix="actor.")
+    teacher = AfterstateValueNet(channels, residual_blocks, future_mode="none")
+    teacher.load_state_dict(actor_state)
+    teacher.requires_grad_(False)
+    teacher.eval()
+    return teacher
 
 
 def load_training_checkpoint(
@@ -171,9 +212,7 @@ def load_training_checkpoint(
 
     old_optimizer = checkpoint["optimizer_state_dict"]
     old_parameter_ids = [
-        parameter_id
-        for group in old_optimizer["param_groups"]
-        for parameter_id in group["params"]
+        parameter_id for group in old_optimizer["param_groups"] for parameter_id in group["params"]
     ]
     old_parameter_names = list(checkpoint_state)
     if len(old_parameter_ids) != len(old_parameter_names):
@@ -184,9 +223,7 @@ def load_training_checkpoint(
     }
     new_optimizer = optimizer.state_dict()
     new_parameter_ids = [
-        parameter_id
-        for group in new_optimizer["param_groups"]
-        for parameter_id in group["params"]
+        parameter_id for group in new_optimizer["param_groups"] for parameter_id in group["params"]
     ]
     new_parameter_names = [name for name, _ in model.named_parameters()]
     if len(new_parameter_ids) != len(new_parameter_names):
@@ -256,6 +293,18 @@ def main() -> None:
     if args.resume is not None and args.initialize_from is not None:
         raise ValueError("--resume and --initialize-from cannot be used together")
     config = apply_overrides(load_config(args.config), args)
+    distillation_enabled = max(
+        config.distillation.coefficient_start,
+        config.distillation.coefficient_end,
+    ) > 0
+    if distillation_enabled and args.distill_from is None:
+        raise ValueError("--distill-from is required when distillation is enabled")
+    if args.distill_from is not None and not distillation_enabled:
+        raise ValueError("a distillation coefficient must be positive with --distill-from")
+    if distillation_enabled and (
+        config.model.input_mode != "afterstate" or config.model.future_mode != "none"
+    ):
+        raise ValueError("distillation requires a future-free afterstate student")
     for name, value in (
         ("iterations", config.training.iterations),
         ("max_hours", config.training.max_hours),
@@ -286,6 +335,10 @@ def main() -> None:
             "split_perturbation": 0.05,
             "optimizer": "fresh",
         }
+    if args.distill_from is not None:
+        config_dict["distillation"]["checkpoint"] = str(args.distill_from)
+        config_dict["distillation"]["target"] = "actor_policy"
+        config_dict["distillation"]["direction"] = "KL(teacher || student)"
     (output_dir / "config.json").write_text(
         json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
     )
@@ -306,6 +359,12 @@ def main() -> None:
         f"{config.ppo.policy_phi_coefficient_start:g} -> "
         f"{config.ppo.policy_phi_coefficient_end:g} over "
         f"{config.ppo.policy_phi_anneal_hours:g} hours"
+    )
+    print(
+        "distillation coefficient: "
+        f"{config.distillation.coefficient_start:g} -> "
+        f"{config.distillation.coefficient_end:g} over "
+        f"{config.distillation.anneal_hours:g} hours"
     )
 
     if config.model.input_mode == "afterstate":
@@ -335,6 +394,15 @@ def main() -> None:
             f"initialization: function-preserving widen from {source_channels} to "
             f"{config.model.channels} channels x {source_blocks} blocks; fresh optimizer"
         )
+    teacher_actor = (
+        load_distillation_teacher(args.distill_from) if args.distill_from is not None else None
+    )
+    if teacher_actor is not None:
+        print(
+            "distillation teacher: future-free actor from "
+            f"{args.distill_from}; {teacher_actor.channels} channels x "
+            f"{teacher_actor.residual_blocks} blocks"
+        )
     print(
         f"model: {config.model.input_mode}, future={config.model.future_mode}, "
         f"{config.model.channels} channels x {config.model.residual_blocks} blocks, "
@@ -361,6 +429,8 @@ def main() -> None:
         raise RuntimeError("parallel rollout currently supports only pretilt input")
     model_device = torch.device("cpu") if use_parallel_runtime else device
     model = model.to(model_device)
+    if teacher_actor is not None:
+        teacher_actor = teacher_actor.to(model_device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.training.learning_rate,
@@ -372,6 +442,7 @@ def main() -> None:
     start_iteration = 0
     best_score = -math.inf
     phi_schedule_elapsed_offset = 0.0
+    distillation_schedule_elapsed_offset = 0.0
     if args.resume is not None:
         checkpoint = load_training_checkpoint(args.resume, model, optimizer, model_device)
         # Optimizer checkpoints also contain their old learning rate.  Keep the
@@ -385,6 +456,9 @@ def main() -> None:
         early_stop_count = int(checkpoint_metrics.get("training/early_stop_count", 0))
         phi_schedule_elapsed_offset = float(
             checkpoint_metrics.get("training/policy_phi_schedule_elapsed_hours", 0.0)
+        )
+        distillation_schedule_elapsed_offset = float(
+            checkpoint_metrics.get("training/distillation_schedule_elapsed_hours", 0.0)
         )
         checkpoint_phi_coefficient = float(
             checkpoint_metrics.get(
@@ -427,6 +501,8 @@ def main() -> None:
         else:
             execution_model = torch.nn.DataParallel(model)
             evaluation_model = torch.nn.DataParallel(model.actor)
+            if teacher_actor is not None:
+                teacher_actor = torch.nn.DataParallel(teacher_actor)
             print(f"data parallel: {torch.cuda.device_count()} CUDA devices")
 
     parallel_runtime = None
@@ -467,6 +543,10 @@ def main() -> None:
         f"{config.ppo.policy_phi_coefficient_end:g} over "
         f"{config.ppo.policy_phi_anneal_hours:g} hours\n"
         f"- reward mode: {config.ppo.reward_mode}\n"
+        f"- distillation coefficient: {config.distillation.coefficient_start:g} -> "
+        f"{config.distillation.coefficient_end:g} over "
+        f"{config.distillation.anneal_hours:g} hours\n"
+        f"- distillation teacher: `{args.distill_from}`\n"
         f"- Phi-greedy evaluation: {config.evaluation.phi_greedy_baseline}\n"
         f"- W&B: {config.wandb.mode}, run ID `{tracker.run_id}`\n",
     )
@@ -488,9 +568,7 @@ def main() -> None:
                 "training/early_stop_count": 0.0,
                 "training/policy_phi_coefficient": config.ppo.policy_phi_coefficient_start,
                 "training/policy_phi_schedule_elapsed_hours": 0.0,
-                "initialization/source_epoch": float(
-                    initialization_checkpoint.get("epoch", -1)
-                ),
+                "initialization/source_epoch": float(initialization_checkpoint.get("epoch", -1)),
             }
         )
         save_checkpoint(
@@ -527,12 +605,21 @@ def main() -> None:
             stopped_by_time_limit = True
             break
         iteration_started = time.monotonic()
-        phi_schedule_elapsed_hours = phi_schedule_elapsed_offset + (
-            iteration_started - training_started
-        ) / 3600
+        phi_schedule_elapsed_hours = (
+            phi_schedule_elapsed_offset + (iteration_started - training_started) / 3600
+        )
         policy_phi_coefficient = scheduled_policy_phi_coefficient(
             config.ppo,
             phi_schedule_elapsed_hours,
+        )
+        distillation_schedule_elapsed_hours = (
+            distillation_schedule_elapsed_offset + (iteration_started - training_started) / 3600
+        )
+        distillation_coefficient = scheduled_coefficient(
+            config.distillation.coefficient_start,
+            config.distillation.coefficient_end,
+            config.distillation.anneal_hours,
+            distillation_schedule_elapsed_hours,
         )
         rollout_started = time.monotonic()
         if parallel_runtime is None:
@@ -583,6 +670,8 @@ def main() -> None:
             )
             if config.model.input_mode == "afterstate":
                 update_kwargs["policy_phi_coefficient"] = policy_phi_coefficient
+                update_kwargs["teacher_actor"] = teacher_actor
+                update_kwargs["distillation_coefficient"] = distillation_coefficient
             update_metrics = update_ppo(
                 execution_model,
                 optimizer,
@@ -617,6 +706,10 @@ def main() -> None:
         metrics["training/learning_rate"] = config.training.learning_rate
         metrics["training/policy_phi_coefficient"] = policy_phi_coefficient
         metrics["training/policy_phi_schedule_elapsed_hours"] = phi_schedule_elapsed_hours
+        metrics["training/distillation_coefficient"] = distillation_coefficient
+        metrics["training/distillation_schedule_elapsed_hours"] = (
+            distillation_schedule_elapsed_hours
+        )
         metrics["training/micro_batch_size"] = float(config.training.micro_batch_size)
         metrics["training/early_stop_count"] = float(early_stop_count)
         metrics["training/early_stop_rate"] = early_stop_count / (iteration + 1)
@@ -642,7 +735,12 @@ def main() -> None:
                 config.ppo.policy_phi_coefficient_end,
                 abs_tol=1e-12,
             )
-            if target_policy_reached and score > best_score:
+            target_distillation_reached = math.isclose(
+                distillation_coefficient,
+                config.distillation.coefficient_end,
+                abs_tol=1e-12,
+            )
+            if target_policy_reached and target_distillation_reached and score > best_score:
                 best_score = score
                 save_checkpoint(
                     output_dir / "best.pt",
@@ -683,9 +781,9 @@ def main() -> None:
 
     if "evaluation/mean_score" not in last_metrics:
         print("running final evaluation", flush=True)
-        final_schedule_elapsed_hours = phi_schedule_elapsed_offset + (
-            time.monotonic() - training_started
-        ) / 3600
+        final_schedule_elapsed_hours = (
+            phi_schedule_elapsed_offset + (time.monotonic() - training_started) / 3600
+        )
         final_policy_phi_coefficient = scheduled_policy_phi_coefficient(
             config.ppo,
             final_schedule_elapsed_hours,
@@ -755,6 +853,19 @@ def main() -> None:
                 last_metrics.get(
                     "training/policy_phi_schedule_elapsed_hours",
                     phi_schedule_elapsed_offset + (time.monotonic() - training_started) / 3600,
+                )
+            ),
+            "training/distillation_coefficient": float(
+                last_metrics.get(
+                    "training/distillation_coefficient",
+                    config.distillation.coefficient_end,
+                )
+            ),
+            "training/distillation_schedule_elapsed_hours": float(
+                last_metrics.get(
+                    "training/distillation_schedule_elapsed_hours",
+                    distillation_schedule_elapsed_offset
+                    + (time.monotonic() - training_started) / 3600,
                 )
             ),
             "evaluation/best_mean_score": best_score,
