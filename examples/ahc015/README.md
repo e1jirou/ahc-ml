@@ -99,6 +99,25 @@ full未来列＋残差late fusionの実験には`config_afterstate_future_late.t
 pooled 64次元と`300 -> 64`で符号化した未来列をconcatし、`128 -> 64 -> 1`のMLPが既存scoreへの
 補正値だけを生成する。補正の最終層はゼロ初期化され、基準の盤面経路を開始時に変更しない。
 
+## 128 channel提出用モデル
+
+`config_afterstate_128.toml`は、未来列なしafterstateモデルを128 channel・10 blockで10時間学習する
+設定である。初期値には最新の64 channel late-fusion checkpointから未来補正を除いた盤面経路を使い、
+各channelを2つに複製する。pointwise convolutionと出力層の入力重みを55%/45%に分配するため、開始時の
+actor・critic関数を保ちながら、最初の更新から複製channelの対称性を崩せる。AdamWの状態と学習回数は
+引き継がず、新しいrunとして学習する。
+
+```bash
+caffeinate -i env PYTHONPATH=python .venv/bin/python \
+  -m examples.ahc015.python.train \
+  --config examples/ahc015/config_afterstate_128.toml \
+  --initialize-from outputs/ahc015/small-20260902-102642/best-training.pt
+```
+
+開始時に固定2,048ケースを評価して`best.pt`を保存するため、PPO更新によって一時的に性能が落ちても
+64 channel教師相当の初期方策は失われない。`--initialize-from`と、学習状態を丸ごと再開する
+`--resume`は同時には指定できない。
+
 ## 検証
 
 ```bash

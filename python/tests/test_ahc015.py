@@ -13,7 +13,11 @@ from examples.ahc015.python.afterstate_features import (
     encode_afterstates,
     encode_future_sequences,
 )
-from examples.ahc015.python.afterstate_model import AfterstatePpoNet, AfterstateValueNet
+from examples.ahc015.python.afterstate_model import (
+    AfterstatePpoNet,
+    AfterstateValueNet,
+    initialize_widened_afterstate_ppo,
+)
 from examples.ahc015.python.afterstate_ppo import (
     AfterstatePpoRollout,
     collect_afterstate_ppo_rollout,
@@ -229,6 +233,16 @@ def test_config_and_ppo_model_shapes() -> None:
     assert alpha0_config.ppo.reward_mode == "potential_shaping"
     assert alpha0_config.ppo.gae_lambda == 0.95
     assert not alpha0_config.evaluation.phi_greedy_baseline
+    submission_config = load_config(config_directory / "config_afterstate_128.toml")
+    assert submission_config.run.seed == 15040
+    assert submission_config.model.input_mode == "afterstate"
+    assert submission_config.model.future_mode == "none"
+    assert submission_config.model.channels == 128
+    assert submission_config.model.residual_blocks == 10
+    assert submission_config.training.max_hours == 10.0
+    assert submission_config.ppo.policy_phi_coefficient_start == 0.0
+    assert submission_config.ppo.reward_mode == "potential_shaping"
+    assert submission_config.wandb.mode == "online"
     future_add_config = load_config(config_directory / "config_afterstate_future_add.toml")
     assert future_add_config.run.seed == 15036
     assert future_add_config.model.input_mode == "afterstate"
@@ -455,6 +469,34 @@ def test_full_future_late_fusion_is_residual_and_action_dependent() -> None:
         )
     assert not torch.allclose(scores_a, scores_b)
     assert torch.equal(correction_off, expected)
+
+
+def test_function_preserving_afterstate_widening_ignores_future_path() -> None:
+    torch.manual_seed(15040)
+    source = AfterstatePpoNet(channels=4, residual_blocks=2, future_mode="full_late").eval()
+    for network in (source.actor, source.critic):
+        torch.nn.init.normal_(network.output.weight, std=0.05)
+        torch.nn.init.normal_(network.output.bias, std=0.05)
+        assert network.correction is not None
+        torch.nn.init.normal_(network.correction.weight, std=0.05)
+
+    target = AfterstatePpoNet(channels=8, residual_blocks=2, future_mode="none").eval()
+    dimensions = initialize_widened_afterstate_ppo(target, source.state_dict())
+    assert dimensions == (4, 2)
+
+    boards = torch.randn(7, BOARD_CHANNELS, SIDE, SIDE)
+    with torch.inference_mode():
+        expected_actor = source.actor(boards, use_future_correction=False)
+        expected_critic = source.critic(boards, use_future_correction=False)
+        actual_actor = target.actor(boards)
+        actual_critic = target.critic(boards)
+    assert torch.allclose(actual_actor, expected_actor, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(actual_critic, expected_critic, atol=1e-6, rtol=1e-5)
+
+    first_copy = target.actor.output.weight[:, :4]
+    second_copy = target.actor.output.weight[:, 4:]
+    assert not torch.equal(first_copy, second_copy)
+    assert torch.allclose(first_copy + second_copy, source.actor.output.weight)
 
 
 def test_afterstate_rollout_smoke() -> None:

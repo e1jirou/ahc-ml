@@ -5,7 +5,7 @@ from torch import nn
 
 from .afterstate_features import FUTURE_CHANNELS, FUTURE_LENGTH
 from .features import BOARD_CHANNELS
-from .model import ResidualDepthwiseBlock
+from .model import ResidualDepthwiseBlock, dimensions_from_state_dict
 
 
 class AfterstateValueNet(nn.Module):
@@ -128,6 +128,86 @@ class AfterstatePpoNet(nn.Module):
                 raise ValueError("candidate_potentials are required when policy Phi is enabled")
             policy_values = policy_phi_coefficient * candidate_potentials + residuals
         return logit_scale * policy_values, action_values.mean(dim=1)
+
+
+def initialize_widened_afterstate_ppo(
+    model: AfterstatePpoNet,
+    source_state_dict: dict[str, torch.Tensor],
+    *,
+    split_perturbation: float = 0.05,
+) -> tuple[int, int]:
+    """Initialize a 2x-wider board-only model without changing its function.
+
+    Each source channel is copied twice. Incoming pointwise/output weights are
+    split unevenly between the copies while preserving their sum, so the initial
+    function is unchanged but the duplicate channels receive different gradients.
+    Future-fusion parameters in the source checkpoint are intentionally ignored.
+    """
+    if model.future_mode != "none":
+        raise ValueError("widened initialization requires a future-free target model")
+    if not 0 <= split_perturbation < 0.5:
+        raise ValueError("split_perturbation must be in [0, 0.5)")
+
+    source_channels, source_blocks = dimensions_from_state_dict(
+        source_state_dict, prefix="actor."
+    )
+    critic_dimensions = dimensions_from_state_dict(source_state_dict, prefix="critic.")
+    if critic_dimensions != (source_channels, source_blocks):
+        raise ValueError("source actor and critic dimensions must match")
+    if model.actor.channels != 2 * source_channels:
+        raise ValueError(
+            f"target channels must be exactly twice the source: "
+            f"source={source_channels}, target={model.actor.channels}"
+        )
+    if model.actor.residual_blocks != source_blocks:
+        raise ValueError(
+            f"source and target residual block counts must match: "
+            f"source={source_blocks}, target={model.actor.residual_blocks}"
+        )
+
+    target_channels = model.actor.channels
+    channel_map = torch.arange(target_channels) % source_channels
+    split = torch.full((target_channels,), 0.5 - split_perturbation)
+    split[:source_channels] = 0.5 + split_perturbation
+    widened_state: dict[str, torch.Tensor] = {}
+    for branch in ("actor", "critic"):
+        stem_weight = source_state_dict[f"{branch}.board_stem.weight"]
+        stem_bias = source_state_dict[f"{branch}.board_stem.bias"]
+        widened_state[f"{branch}.board_stem.weight"] = stem_weight.index_select(
+            0, channel_map
+        )
+        widened_state[f"{branch}.board_stem.bias"] = stem_bias.index_select(0, channel_map)
+        for block in range(source_blocks):
+            prefix = f"{branch}.blocks.{block}"
+            depthwise_weight = source_state_dict[f"{prefix}.depthwise.weight"]
+            depthwise_bias = source_state_dict[f"{prefix}.depthwise.bias"]
+            widened_state[f"{prefix}.depthwise.weight"] = depthwise_weight.index_select(
+                0, channel_map
+            )
+            widened_state[f"{prefix}.depthwise.bias"] = depthwise_bias.index_select(
+                0, channel_map
+            )
+            pointwise_weight = source_state_dict[f"{prefix}.pointwise.weight"]
+            widened_pointwise = pointwise_weight.index_select(0, channel_map).index_select(
+                1, channel_map
+            )
+            widened_state[f"{prefix}.pointwise.weight"] = widened_pointwise * split[
+                None, :, None, None
+            ]
+            pointwise_bias = source_state_dict[f"{prefix}.pointwise.bias"]
+            widened_state[f"{prefix}.pointwise.bias"] = pointwise_bias.index_select(
+                0, channel_map
+            )
+        output_weight = source_state_dict[f"{branch}.output.weight"]
+        widened_state[f"{branch}.output.weight"] = output_weight.index_select(
+            1, channel_map
+        ) * split[None, :]
+        widened_state[f"{branch}.output.bias"] = source_state_dict[
+            f"{branch}.output.bias"
+        ].clone()
+
+    model.load_state_dict(widened_state)
+    return source_channels, source_blocks
 
 
 def parameter_count(model: nn.Module) -> int:

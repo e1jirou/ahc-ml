@@ -18,7 +18,7 @@ from ahc_ml.tracking import WandbTracker
 from ahc_ml.visualization import render_model_graph
 
 from .afterstate_features import FUTURE_CHANNELS, FUTURE_LENGTH
-from .afterstate_model import AfterstatePpoNet
+from .afterstate_model import AfterstatePpoNet, initialize_widened_afterstate_ppo
 from .afterstate_ppo import collect_afterstate_ppo_rollout, update_afterstate_ppo
 from .afterstate_simulation import evaluate_afterstate_policy
 from .config import Ahc015Config, PpoConfig, load_config
@@ -53,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment-log", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--resume", type=Path, help="resume from a full PPO training checkpoint")
+    parser.add_argument(
+        "--initialize-from",
+        type=Path,
+        help="initialize a 2x-wider afterstate model from a full PPO checkpoint",
+    )
     return parser.parse_args()
 
 
@@ -248,6 +253,8 @@ def apply_overrides(config: Ahc015Config, args: argparse.Namespace) -> Ahc015Con
 
 def main() -> None:
     args = parse_args()
+    if args.resume is not None and args.initialize_from is not None:
+        raise ValueError("--resume and --initialize-from cannot be used together")
     config = apply_overrides(load_config(args.config), args)
     for name, value in (
         ("iterations", config.training.iterations),
@@ -272,6 +279,13 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=False)
     config_dict = config.to_dict()
     config_dict["device_info"] = device_info.to_dict()
+    if args.initialize_from is not None:
+        config_dict["initialization"] = {
+            "mode": "function_preserving_widen_2x",
+            "checkpoint": str(args.initialize_from),
+            "split_perturbation": 0.05,
+            "optimizer": "fresh",
+        }
     (output_dir / "config.json").write_text(
         json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
     )
@@ -306,6 +320,21 @@ def main() -> None:
         model = Ahc015PpoNet(config.model.channels, config.model.residual_blocks)
         collect_rollout = collect_ppo_rollout
         update_ppo = ppo_update
+    initialization_checkpoint = None
+    if args.initialize_from is not None:
+        if config.model.input_mode != "afterstate":
+            raise ValueError("--initialize-from supports only afterstate models")
+        initialization_checkpoint = torch.load(
+            args.initialize_from, map_location="cpu", weights_only=False
+        )
+        source_channels, source_blocks = initialize_widened_afterstate_ppo(
+            model,
+            initialization_checkpoint["model_state_dict"],
+        )
+        print(
+            f"initialization: function-preserving widen from {source_channels} to "
+            f"{config.model.channels} channels x {source_blocks} blocks; fresh optimizer"
+        )
     print(
         f"model: {config.model.input_mode}, future={config.model.future_mode}, "
         f"{config.model.channels} channels x {config.model.residual_blocks} blocks, "
@@ -423,8 +452,6 @@ def main() -> None:
 
     last_metrics: dict[str, float] = {"training/update": float(update)}
     last_iteration = start_iteration - 1
-    training_started = time.monotonic()
-    deadline = training_started + config.training.max_hours * 3600
     stopped_by_time_limit = False
     log_path = Path(config.run.experiment_log)
     append_experiment_log(
@@ -444,6 +471,57 @@ def main() -> None:
         f"- W&B: {config.wandb.mode}, run ID `{tracker.run_id}`\n",
     )
 
+    if initialization_checkpoint is not None:
+        initial_metrics = evaluate(
+            evaluation_model,
+            model,
+            device,
+            config,
+            parallel_runtime,
+            config.ppo.policy_phi_coefficient_start,
+        )
+        best_score = initial_metrics["evaluation/mean_score"]
+        initial_metrics.update(
+            {
+                "training/update": 0.0,
+                "training/environment_transitions": 0.0,
+                "training/early_stop_count": 0.0,
+                "training/policy_phi_coefficient": config.ppo.policy_phi_coefficient_start,
+                "training/policy_phi_schedule_elapsed_hours": 0.0,
+                "initialization/source_epoch": float(
+                    initialization_checkpoint.get("epoch", -1)
+                ),
+            }
+        )
+        save_checkpoint(
+            output_dir / "best.pt",
+            model=model.actor,
+            optimizer=optimizer,
+            epoch=-1,
+            config=config_dict,
+            metrics=initial_metrics,
+        )
+        save_checkpoint(
+            output_dir / "best-training.pt",
+            model=model,
+            optimizer=optimizer,
+            epoch=-1,
+            config=config_dict,
+            metrics=initial_metrics,
+        )
+        print(
+            f"initial widened model mean score: {best_score:.3f} "
+            f"({config.evaluation.episodes} fixed cases)"
+        )
+        append_experiment_log(
+            log_path,
+            f"- initialization: function-preserving 2x channel widening from "
+            f"`{args.initialize_from}`; optimizer state reset\n"
+            f"- initial widened mean score: {best_score:.3f}\n",
+        )
+
+    training_started = time.monotonic()
+    deadline = training_started + config.training.max_hours * 3600
     for iteration in range(start_iteration, config.training.iterations):
         if time.monotonic() >= deadline:
             stopped_by_time_limit = True

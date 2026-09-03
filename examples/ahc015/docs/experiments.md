@@ -1341,3 +1341,40 @@
   さらに高く、正しい未来列は誤った未来列や順序を壊した未来列を上回らなかった。改善の大半は30時間の
   追加学習を受けた共有CNN・既存headによるもので、現在の補正MLPが未来情報を有益に利用した証拠はない。
   full未来列の表現を否定する結果ではなく、盤面だけでも表現できる補正MLPへ依存した結合方式の問題とみる
+
+## 2026-09-02 未来列なし128 channel提出用モデル・10時間（準備）
+
+- 方針: 未来列は採用せず、afterstate、canonical味3面＋空きマス1面、policy `alpha=0`、potential
+  shapingを維持したまま、モデル幅だけを64から128 channelへ増やす。residual block数は10のまま
+- 初期化元: `outputs/ahc015/small-20260902-102642/best-training.pt`。5,000ケースablationで平均
+  787,450.627だった未来補正OFFの盤面経路を、actor・criticとも教師として使う
+- 初期化方法: 各64 channelを2つに複製する。各pointwise convolutionと最終出力層では複製入力への
+  weightを55%/45%に分配し、和を元のweightに一致させる。初期関数を保ちつつ、複製channelへ異なる
+  勾配を流して対称性を崩す。未来encoder・fusion・correctionは移さない
+- optimizer: 教師のAdamW stateや学習カウンタは引き継がず、新規に開始する
+- 保全: PPO開始前に固定2,048ケースを評価し、初期128 channelモデルもbest checkpoint候補として保存する
+- 比較条件: rollout 4,096局、1 epoch、minibatch 1,024、microbatch 128、評価interval 2、10時間、
+  MPS、W&B online
+- config: `examples/ahc015/config_afterstate_128.toml`
+- seed: `15040`
+
+## small-20260902-233926
+
+- algorithm: PPO
+- status: started
+- output: `outputs/ahc015/small-20260902-233926`
+- input mode: afterstate
+- future mode: none
+- device: mps (Apple Metal Performance Shaders)
+- seed: 15040
+- wall-clock limit: 10.000 hours
+- policy Phi coefficient: 0 -> 0 over 0 hours
+- reward mode: potential_shaping
+- Phi-greedy evaluation: False
+- W&B: online, run ID `o4nxbt9c`
+- initialization: function-preserving 2x channel widening from `outputs/ahc015/small-20260902-102642/best-training.pt`; optimizer state reset
+- initial widened mean score: 790296.413
+- status: time limit reached
+- elapsed: 10.132 hours
+- updates: 17424
+- best mean score: 790296.413

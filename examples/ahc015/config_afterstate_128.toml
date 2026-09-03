@@ -1,0 +1,50 @@
+[run]
+seed = 15040
+device = "mps"
+deterministic = false
+output_dir = "outputs/ahc015"
+experiment_log = "examples/ahc015/docs/experiments.md"
+
+[model]
+channels = 128
+residual_blocks = 10
+input_mode = "afterstate"
+future_mode = "none"
+
+[training]
+iterations = 1000
+rollout_episodes = 4096
+epochs = 1
+batch_size = 1024
+micro_batch_size = 128
+learning_rate = 0.0003
+weight_decay = 0.0001
+gradient_clip_norm = 1.0
+checkpoint_interval = 5
+max_hours = 10.0
+inference_batch_size = 4096
+
+[ppo]
+gamma = 1.0
+gae_lambda = 0.95
+clip_ratio = 0.2
+value_clip = 0.2
+value_coefficient = 0.5
+entropy_coefficient = 0.01
+logit_scale = 12.0
+target_kl = 0.03
+policy_phi_coefficient_start = 0.0
+policy_phi_coefficient_end = 0.0
+policy_phi_anneal_hours = 0.0
+reward_mode = "potential_shaping"
+
+[evaluation]
+interval = 2
+episodes = 2048
+seed = 515015
+phi_greedy_baseline = false
+
+[wandb]
+project = "ahc-ml"
+entity = ""
+mode = "online"
