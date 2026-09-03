@@ -23,6 +23,7 @@ from .afterstate_model import (
     AfterstateValueNet,
     initialize_widened_afterstate_ppo,
 )
+from .afterstate_parallel_runtime import ParallelAfterstateRuntime
 from .afterstate_ppo import collect_afterstate_ppo_rollout, update_afterstate_ppo
 from .afterstate_simulation import evaluate_afterstate_policy
 from .config import Ahc015Config, PpoConfig, load_config
@@ -81,7 +82,7 @@ def evaluate(
     training_model: torch.nn.Module,
     device: torch.device,
     config: Ahc015Config,
-    parallel_runtime: ParallelAhc015Runtime | None,
+    parallel_runtime: ParallelAhc015Runtime | ParallelAfterstateRuntime | None,
     policy_phi_coefficient: float,
 ) -> dict[str, float]:
     flavors, ranks = generate_cases(config.evaluation.episodes, config.evaluation.seed)
@@ -322,7 +323,7 @@ def main() -> None:
     rng = np.random.default_rng(config.run.seed)
     device, device_info = select_device(config.run.device)
 
-    run_name = datetime.now().strftime("small-%Y%m%d-%H%M%S")
+    run_name = datetime.now().strftime(f"{config.run.name_prefix}-%Y%m%d-%H%M%S")
     output_root = args.output_dir or Path(config.run.output_dir)
     output_dir = output_root / run_name
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -425,8 +426,6 @@ def main() -> None:
     )
     print(f"actor graph: {graph_svg}")
     use_parallel_runtime = config.training.rollout_processes > 1
-    if use_parallel_runtime and config.model.input_mode != "pretilt":
-        raise RuntimeError("parallel rollout currently supports only pretilt input")
     model_device = torch.device("cpu") if use_parallel_runtime else device
     model = model.to(model_device)
     if teacher_actor is not None:
@@ -497,7 +496,13 @@ def main() -> None:
         if device.type != "cuda" or torch.cuda.device_count() < 2:
             raise RuntimeError("data parallel training requires at least two CUDA devices")
         if use_parallel_runtime:
-            print(f"data parallel PPO worker: {torch.cuda.device_count()} CUDA devices")
+            parallel_backend = (
+                "DDP" if config.model.input_mode == "afterstate" else "DataParallel"
+            )
+            print(
+                f"{parallel_backend} PPO update: "
+                f"{torch.cuda.device_count()} CUDA devices"
+            )
         else:
             execution_model = torch.nn.DataParallel(model)
             evaluation_model = torch.nn.DataParallel(model.actor)
@@ -513,7 +518,12 @@ def main() -> None:
             raise ValueError("rollout episodes must be divisible by rollout processes")
         if config.evaluation.episodes % config.training.rollout_processes:
             raise ValueError("evaluation episodes must be divisible by rollout processes")
-        parallel_runtime = ParallelAhc015Runtime(
+        runtime_class = (
+            ParallelAfterstateRuntime
+            if config.model.input_mode == "afterstate"
+            else ParallelAhc015Runtime
+        )
+        parallel_runtime = runtime_class(
             workers=config.training.rollout_processes,
             episodes=config.training.rollout_episodes,
             channels=config.model.channels,
@@ -641,12 +651,20 @@ def main() -> None:
                 **collect_kwargs,
             )
         else:
-            rollout, _, rollout_metrics = parallel_runtime.collect(
-                model,
+            parallel_collect_kwargs = dict(
                 gamma=config.ppo.gamma,
                 gae_lambda=config.ppo.gae_lambda,
                 logit_scale=config.ppo.logit_scale,
                 inference_batch_size=config.training.inference_batch_size,
+            )
+            if config.model.input_mode == "afterstate":
+                parallel_collect_kwargs.update(
+                    policy_phi_coefficient=policy_phi_coefficient,
+                    reward_mode=config.ppo.reward_mode,
+                    future_mode=config.model.future_mode,
+                )
+            rollout, _, rollout_metrics = parallel_runtime.collect(
+                model, **parallel_collect_kwargs
             )
         environment_transitions += len(rollout)
         metrics: dict[str, float] = {
@@ -681,9 +699,7 @@ def main() -> None:
                 **update_kwargs,
             )
         else:
-            update_metrics = parallel_runtime.update(
-                model,
-                optimizer,
+            parallel_update_kwargs = dict(
                 epochs=config.training.epochs,
                 batch_size=config.training.batch_size,
                 micro_batch_size=config.training.micro_batch_size,
@@ -697,6 +713,14 @@ def main() -> None:
                 logit_scale=config.ppo.logit_scale,
                 target_kl=config.ppo.target_kl,
                 data_parallel=config.training.data_parallel,
+            )
+            if config.model.input_mode == "afterstate":
+                parallel_update_kwargs.update(
+                    teacher_actor=teacher_actor,
+                    distillation_coefficient=distillation_coefficient,
+                )
+            update_metrics = parallel_runtime.update(
+                model, optimizer, **parallel_update_kwargs
             )
         update += int(update_metrics["training/updates_this_iteration"])
         early_stop_count += int(update_metrics["training/early_stop"])

@@ -4,6 +4,7 @@ device = "cuda"
 deterministic = false
 output_dir = "outputs/ahc015"
 experiment_log = "examples/ahc015/docs/experiments.md"
+name_prefix = "distill"
 
 [model]
 channels = 128
@@ -24,6 +25,7 @@ checkpoint_interval = 5
 max_hours = 3.0
 inference_batch_size = 4096
 data_parallel = true
+rollout_processes = 2
 
 [ppo]
 gamma = 1.0

@@ -126,6 +126,9 @@ actor分布に対する`KL(teacher || student)`だけを補助損失へ加える
 実時間3時間で`1`から`0`へ線形減衰し、PPOのpotential shapingとpolicy `alpha=0`は維持する。
 
 NotebookはKaggle T4 x2、W&B online用であり、`config_afterstate_128_distill.toml`を実行する。
+rolloutと評価は2つの独立processへ半分ずつ分配し、PPO＋蒸留更新はNCCLによる2-process DDPで
+勾配を同期する。本番runの前に8局・1 iterationの同じmulti-GPU経路をW&B disabledで検証する。
+この段階のW&B run名と出力ディレクトリ名は`distill-<時刻>`とする。
 教師checkpointはW&B run `small-20260902-102642`の64 channel bestからfuture encoder・fusion・
 correctionを除いた盤面経路である。future入力は生成も使用もしない。この経路の5,000ケースablation
 平均は787,450.627だった。3時間終了後の`best-training.pt`を次の蒸留なし17時間PPOの開始点に使う。

@@ -13,6 +13,7 @@ class RunConfig:
     deterministic: bool
     output_dir: str
     experiment_log: str
+    name_prefix: str = "small"
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,8 @@ def load_config(path: str | Path) -> Ahc015Config:
         _positive(name, value)
     if config.training.micro_batch_size > config.training.batch_size:
         raise ValueError("training.micro_batch_size must not exceed training.batch_size")
+    if not config.run.name_prefix or not config.run.name_prefix.replace("-", "").isalnum():
+        raise ValueError("run.name_prefix must contain only letters, numbers, and hyphens")
     if config.training.rollout_processes not in {1, 2}:
         raise ValueError("training.rollout_processes must be 1 or 2")
     if config.model.input_mode not in {"pretilt", "afterstate"}:

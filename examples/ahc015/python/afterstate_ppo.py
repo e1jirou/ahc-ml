@@ -42,6 +42,73 @@ class AfterstatePpoRollout:
         return len(self.actions)
 
 
+@dataclass(frozen=True, slots=True)
+class AfterstatePpoRolloutStorage:
+    """Turn-major afterstate rollout arrays, optionally backed by shared memory."""
+
+    board_features: NDArray[np.uint8]
+    future_features: NDArray[np.uint8] | None
+    candidate_potentials: NDArray[np.float32] | None
+    actions: NDArray[np.int64]
+    old_log_probs: NDArray[np.float32]
+    old_values: NDArray[np.float32]
+    advantages: NDArray[np.float32]
+    returns: NDArray[np.float32]
+
+    @classmethod
+    def empty(
+        cls,
+        episodes: int,
+        *,
+        future_mode: str,
+        policy_phi_coefficient: float,
+    ) -> AfterstatePpoRolloutStorage:
+        prefix = (CELL_COUNT - 1, episodes)
+        return cls(
+            board_features=np.empty(
+                (*prefix, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE), dtype=np.uint8
+            ),
+            future_features=(
+                np.empty((*prefix, FUTURE_CHANNELS, FUTURE_LENGTH), dtype=np.uint8)
+                if future_mode != "none"
+                else None
+            ),
+            candidate_potentials=(
+                np.empty((*prefix, ACTION_COUNT), dtype=np.float32)
+                if policy_phi_coefficient != 0.0
+                else None
+            ),
+            actions=np.empty(prefix, dtype=np.int64),
+            old_log_probs=np.empty(prefix, dtype=np.float32),
+            old_values=np.empty(prefix, dtype=np.float32),
+            advantages=np.empty(prefix, dtype=np.float32),
+            returns=np.empty(prefix, dtype=np.float32),
+        )
+
+    def as_rollout(self) -> AfterstatePpoRollout:
+        transitions = self.actions.size
+        return AfterstatePpoRollout(
+            board_features=self.board_features.reshape(
+                transitions, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE
+            ),
+            future_features=(
+                self.future_features.reshape(transitions, FUTURE_CHANNELS, FUTURE_LENGTH)
+                if self.future_features is not None
+                else None
+            ),
+            candidate_potentials=(
+                self.candidate_potentials.reshape(transitions, ACTION_COUNT)
+                if self.candidate_potentials is not None
+                else None
+            ),
+            actions=self.actions.reshape(transitions),
+            old_log_probs=self.old_log_probs.reshape(transitions),
+            old_values=self.old_values.reshape(transitions),
+            advantages=self.advantages.reshape(transitions),
+            returns=self.returns.reshape(transitions),
+        )
+
+
 def _sample_actions(
     probabilities: NDArray[np.float32], rng: np.random.Generator
 ) -> NDArray[np.int64]:
@@ -63,6 +130,7 @@ def collect_afterstate_ppo_rollout(
     policy_phi_coefficient: float = 1.0,
     reward_mode: str = "potential_shaping",
     future_mode: str = "none",
+    storage: AfterstatePpoRolloutStorage | None = None,
 ) -> tuple[AfterstatePpoRollout, EvaluationResult, dict[str, float]]:
     if reward_mode not in {"potential_shaping", "terminal"}:
         raise ValueError("reward_mode must be potential_shaping or terminal")
@@ -74,22 +142,19 @@ def collect_afterstate_ppo_rollout(
     score_denominators = np.asarray([denominator(row) for row in flavors])
 
     steps = CELL_COUNT - 1
-    board_storage = np.empty(
-        (steps, episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE), dtype=np.uint8
+    rollout_storage = storage or AfterstatePpoRolloutStorage.empty(
+        episodes,
+        future_mode=future_mode,
+        policy_phi_coefficient=policy_phi_coefficient,
     )
-    future_storage = (
-        np.empty((steps, episodes, FUTURE_CHANNELS, FUTURE_LENGTH), dtype=np.uint8)
-        if future_mode != "none"
-        else None
-    )
-    potential_storage = (
-        np.empty((steps, episodes, ACTION_COUNT), dtype=np.float32)
-        if policy_phi_coefficient != 0.0
-        else None
-    )
-    action_storage = np.empty((steps, episodes), dtype=np.int64)
-    log_prob_storage = np.empty((steps, episodes), dtype=np.float32)
-    value_storage = np.empty((steps, episodes), dtype=np.float32)
+    if rollout_storage.actions.shape != (steps, episodes):
+        raise ValueError("afterstate rollout storage has an incompatible episode count")
+    if (rollout_storage.future_features is not None) != (future_mode != "none"):
+        raise ValueError("afterstate rollout storage has incompatible future features")
+    if (rollout_storage.candidate_potentials is not None) != (
+        policy_phi_coefficient != 0.0
+    ):
+        raise ValueError("afterstate rollout storage has incompatible candidate potentials")
     state_potential_storage = (
         np.empty((steps, episodes), dtype=np.float32)
         if reward_mode == "potential_shaping"
@@ -114,7 +179,9 @@ def collect_afterstate_ppo_rollout(
         )
         board_features = flat_features.reshape(episodes, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE)
         future_features = (
-            encode_future_sequences(flavors, turn + 1) if future_storage is not None else None
+            encode_future_sequences(flavors, turn + 1)
+            if rollout_storage.future_features is not None
+            else None
         )
         candidate_potentials = None
         if policy_phi_coefficient != 0.0:
@@ -163,16 +230,18 @@ def collect_afterstate_ppo_rollout(
         chosen_probabilities = probabilities[np.arange(episodes), chosen]
         boards = candidates[np.arange(episodes), chosen]
 
-        board_storage[turn] = board_features
-        if future_storage is not None:
+        rollout_storage.board_features[turn] = board_features
+        if rollout_storage.future_features is not None:
             assert future_features is not None
-            future_storage[turn] = future_features
-        if potential_storage is not None:
+            rollout_storage.future_features[turn] = future_features
+        if rollout_storage.candidate_potentials is not None:
             assert candidate_potentials is not None
-            potential_storage[turn] = candidate_potentials
-        action_storage[turn] = chosen
-        log_prob_storage[turn] = np.log(np.maximum(chosen_probabilities, 1e-12))
-        value_storage[turn] = values_array
+            rollout_storage.candidate_potentials[turn] = candidate_potentials
+        rollout_storage.actions[turn] = chosen
+        rollout_storage.old_log_probs[turn] = np.log(
+            np.maximum(chosen_probabilities, 1e-12)
+        )
+        rollout_storage.old_values[turn] = values_array
         entropy_steps.append(float((-probabilities * np.log(probabilities + 1e-12)).sum(1).mean()))
 
     boards = place_at_ranks(boards, ranks[:, -1], flavors[:, -1])
@@ -189,29 +258,13 @@ def collect_afterstate_ppo_rollout(
             (state_potentials[:, 1:], final_potentials[:, None]), axis=1
         )
         rewards = next_potentials - state_potentials
-    values = value_storage.T
+    values = rollout_storage.old_values.T
     advantages, returns = generalized_advantages(
         rewards, values, gamma=gamma, gae_lambda=gae_lambda
     )
-    transitions = steps * episodes
-    rollout = AfterstatePpoRollout(
-        board_features=board_storage.reshape(transitions, ACTION_COUNT, BOARD_CHANNELS, SIDE, SIDE),
-        future_features=(
-            future_storage.reshape(transitions, FUTURE_CHANNELS, FUTURE_LENGTH)
-            if future_storage is not None
-            else None
-        ),
-        candidate_potentials=(
-            potential_storage.reshape(transitions, ACTION_COUNT)
-            if potential_storage is not None
-            else None
-        ),
-        actions=action_storage.reshape(transitions),
-        old_log_probs=log_prob_storage.reshape(transitions),
-        old_values=value_storage.reshape(transitions),
-        advantages=advantages.T.reshape(transitions),
-        returns=returns.T.reshape(transitions),
-    )
+    rollout_storage.advantages[:] = advantages.T
+    rollout_storage.returns[:] = returns.T
+    rollout = rollout_storage.as_rollout()
     scores = np.floor(1_000_000 * final_potentials + 0.5).astype(np.int64)
     result = EvaluationResult(scores, final_potentials.astype(np.float64))
     return (
@@ -223,7 +276,12 @@ def collect_afterstate_ppo_rollout(
             "rollout/mean_score": float(scores.mean()),
             "rollout/value_mean": float(values.mean()),
             "rollout/feature_buffer_gib": (
-                board_storage.nbytes + (future_storage.nbytes if future_storage is not None else 0)
+                rollout_storage.board_features.nbytes
+                + (
+                    rollout_storage.future_features.nbytes
+                    if rollout_storage.future_features is not None
+                    else 0
+                )
             )
             / (1024**3),
             "rollout/policy_phi_coefficient": policy_phi_coefficient,
@@ -231,7 +289,9 @@ def collect_afterstate_ppo_rollout(
                 steps * episodes if state_potential_storage is not None else 0
             ),
             "rollout/candidate_phi_evaluations": float(
-                steps * episodes * ACTION_COUNT if potential_storage is not None else 0
+                steps * episodes * ACTION_COUNT
+                if rollout_storage.candidate_potentials is not None
+                else 0
             ),
             "rollout/final_phi_evaluations": float(episodes),
         },
@@ -258,6 +318,8 @@ def update_afterstate_ppo(
     policy_phi_coefficient: float = 1.0,
     teacher_actor: torch.nn.Module | None = None,
     distillation_coefficient: float = 0.0,
+    advantage_mean: float | None = None,
+    advantage_std: float | None = None,
 ) -> dict[str, float]:
     if micro_batch_size is None:
         micro_batch_size = batch_size
@@ -268,7 +330,9 @@ def update_afterstate_ppo(
     if distillation_coefficient > 0 and teacher_actor is None:
         raise ValueError("teacher_actor is required when distillation is enabled")
     advantages = rollout.advantages.copy()
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    normalization_mean = advantages.mean() if advantage_mean is None else advantage_mean
+    normalization_std = advantages.std() if advantage_std is None else advantage_std
+    advantages = (advantages - normalization_mean) / (normalization_std + 1e-8)
     metric_rows: dict[str, list[float]] = {
         name: []
         for name in (

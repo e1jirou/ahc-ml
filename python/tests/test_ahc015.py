@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import multiprocessing as mp
 from pathlib import Path
 
 import numpy as np
@@ -18,8 +19,10 @@ from examples.ahc015.python.afterstate_model import (
     AfterstateValueNet,
     initialize_widened_afterstate_ppo,
 )
+from examples.ahc015.python.afterstate_parallel_runtime import _create_shared_rollout
 from examples.ahc015.python.afterstate_ppo import (
     AfterstatePpoRollout,
+    AfterstatePpoRolloutStorage,
     collect_afterstate_ppo_rollout,
     update_afterstate_ppo,
 )
@@ -230,6 +233,9 @@ def test_config_and_ppo_model_shapes() -> None:
     assert distill_config.distillation.coefficient_start == 1.0
     assert distill_config.distillation.coefficient_end == 0.0
     assert distill_config.distillation.anneal_hours == 3.0
+    assert distill_config.training.data_parallel
+    assert distill_config.training.rollout_processes == 2
+    assert distill_config.run.name_prefix == "distill"
     assert afterstate_config.evaluation.episodes == 2048
     no_phi_config = load_config(config_directory / "config_afterstate_no_phi.toml")
     assert no_phi_config.run.seed == 15031
@@ -658,6 +664,27 @@ def test_afterstate_rollout_smoke() -> None:
     assert np.all((result.potentials >= 0) & (result.potentials <= 1))
     assert metrics["rollout/mean_score"] > 0
 
+    explicit_storage = AfterstatePpoRolloutStorage.empty(
+        2,
+        future_mode="none",
+        policy_phi_coefficient=1.0,
+    )
+    stored_rollout, stored_result, stored_metrics = collect_afterstate_ppo_rollout(
+        AfterstatePpoNet(),
+        torch.device("cpu"),
+        episodes=2,
+        rng=np.random.default_rng(15031),
+        gamma=1.0,
+        gae_lambda=0.95,
+        logit_scale=12.0,
+        inference_batch_size=8,
+        storage=explicit_storage,
+    )
+    for field in AfterstatePpoRollout.__dataclass_fields__:
+        assert np.array_equal(getattr(stored_rollout, field), getattr(rollout, field))
+    assert np.array_equal(stored_result.scores, result.scores)
+    assert stored_metrics == metrics
+
     future_rollout, _, _ = collect_afterstate_ppo_rollout(
         AfterstatePpoNet(future_mode="full_add"),
         torch.device("cpu"),
@@ -671,6 +698,25 @@ def test_afterstate_rollout_smoke() -> None:
     )
     assert future_rollout.future_features is not None
     assert future_rollout.future_features.shape == (99, FUTURE_CHANNELS, FUTURE_LENGTH)
+
+
+def test_shared_afterstate_rollout_has_disjoint_worker_storage() -> None:
+    shared = _create_shared_rollout(mp.get_context("spawn"), workers=2, episodes_per_worker=1)
+    first = shared.worker_storage(0)
+    second = shared.worker_storage(1)
+    first.actions.fill(1)
+    second.actions.fill(2)
+    first.board_features.fill(0)
+    second.board_features.fill(1)
+
+    rollout = shared.as_rollout()
+    assert len(rollout) == 2 * (CELL_COUNT - 1)
+    assert np.all(rollout.actions[: CELL_COUNT - 1] == 1)
+    assert np.all(rollout.actions[CELL_COUNT - 1 :] == 2)
+    assert np.all(rollout.board_features[: CELL_COUNT - 1] == 0)
+    assert np.all(rollout.board_features[CELL_COUNT - 1 :] == 1)
+    assert rollout.future_features is None
+    assert rollout.candidate_potentials is None
 
 
 def test_afterstate_rollout_and_update_with_only_final_phi(

@@ -1411,8 +1411,13 @@
   future入力を渡さず、criticは教師にしない
 - 補助損失: 4候補に対する`KL(teacher || student)`。係数を実時間3時間で`1 -> 0`へ線形減衰する
 - PPO: potential shapingを維持し、policy Phi係数は`alpha=0`。学習率`1e-4`、entropy係数`0.003`
-- 実行: Kaggle T4 x2、DataParallel、rollout 4,096局、minibatch 1,024、microbatch 512、固定評価
+- 実行: Kaggle T4 x2。rollout・評価はGPU別の2 process、更新は2-process DDP/NCCL。rollout
+  4,096局、minibatch 1,024、microbatch 512、固定評価
   2,048ケース/2 iteration、W&B online、seed `15041`、3時間
 - Notebook: `examples/ahc015/ahc015-128-distillation.ipynb`
+- W&B run名: `distill-<時刻>`
 - 次段階: このrunの`best-training.pt`から蒸留係数0で17時間PPOを継続し、状況確認後にbestから
   さらに10時間継続する
+- KaggleのPyTorch 2.10.0+cu128では単一process・multi-threadのDataParallel rolloutがCUDA
+  illegal memory accessで2回失敗した（run `9fjtihka`、`yw8h7le6`。ともに更新前）。pre-tilt時代と
+  同様にrollout・評価をGPU別processへ分離し、更新はPyTorch推奨のDDPへ置き換える
