@@ -1421,3 +1421,31 @@
 - KaggleのPyTorch 2.10.0+cu128では単一process・multi-threadのDataParallel rolloutがCUDA
   illegal memory accessで2回失敗した（run `9fjtihka`、`yw8h7le6`。ともに更新前）。pre-tilt時代と
   同様にrollout・評価をGPU別processへ分離し、更新はPyTorch推奨のDDPへ置き換える
+
+## 2026-09-03 未来列なし128 channel・ランダム初期化＋方策蒸留（結果）
+
+- W&B: `distill-20260903-045216`（run ID `v1fy4rlz`）、正常終了
+- 実行時間: 3.084時間、24 iteration、9,732,096 environment transitions
+- 固定2,048ケース評価: 677,112.189（iteration 1）から768,329.384（iteration 23）まで改善。
+  最終評価がrun内best、標準誤差1,935.455
+- 蒸留KL: 0.727から0.143へ低下。蒸留係数は最後のiteration開始時点で0.0167まで減衰した。
+  2.95時間時点で開始したiterationが3時間をまたいだため厳密な0ではないが、次runでは設定値を0にする
+- 実装確認: rollout・評価はGPU別2 process、更新は2-process DDP/NCCLで完走。actor用`best.pt`と
+  学習再開用`best-training.pt`をW&B artifact `v0`として保存済み
+- 判断: 3時間の初期化段階として学習は正常。教師の盤面のみ平均787,450.627には未到達だが、予定どおり
+  best checkpointから蒸留なしPPOへ移行する
+
+## 2026-09-03 未来列なし128 channel・蒸留なしPPO 5時間（準備）
+
+- 開始点: W&B run `distill-20260903-045216`のtraining checkpoint `v0`、iteration 23、
+  固定評価768,329.384
+- 条件: afterstate、未来列なし、128 channel・10 block、potential shaping、policy `alpha=0`、
+  蒸留係数0、学習率`3e-4`、entropy係数`0.01`。蒸留中の`1e-4`・`0.003`から、学習初期の探索を
+  重視した通常PPO設定へ戻す。飽和が近づいた後にentropy係数の低下を再検討する
+- 実行: Kaggle T4 x2、rollout・評価はGPU別2 process、更新は2-process DDP/NCCL、rollout 4,096局、
+  固定評価2,048ケース/2 iteration、seed `15042`、5時間
+- 設定: `examples/ahc015/config_afterstate_128_continue.toml`
+- Notebook: `examples/ahc015/ahc015-128-ppo.ipynb`。本番前に同じresume経路を8局・1 iterationで検証する
+- W&B run名: `large-<時刻>`
+- microbatch: 暫定値512（GPUあたり256）。T4 x2で最適化済みではないため、本学習前に
+  `ahc015-128-microbatch-benchmark.ipynb`でglobal 256/512/1,024を同一rollout・各2回比較して確定する

@@ -133,6 +133,16 @@ rolloutと評価は2つの独立processへ半分ずつ分配し、PPO＋蒸留�
 correctionを除いた盤面経路である。future入力は生成も使用もしない。この経路の5,000ケースablation
 平均は787,450.627だった。3時間終了後の`best-training.pt`を次の蒸留なし17時間PPOの開始点に使う。
 
+### 蒸留後のPPO継続
+
+`ahc015-128-ppo.ipynb`は、W&B run `distill-20260903-045216`の`best-training.pt`から、
+蒸留係数を0にして最初の5時間を継続する。future modeは`none`のまま、potential shaping、policy
+`alpha=0`を維持し、蒸留終了後は学習率`3e-4`・entropy係数`0.01`の通常PPO設定へ戻す。Kaggle T4 x2ではrollout・評価を
+GPU別process、PPO更新を2-process DDP/NCCLで実行し、本番前に同じresume経路を短いsmoke testで
+確認する。設定は`config_afterstate_128_continue.toml`、W&B run名は`large-<時刻>`とする。
+本学習前のmicrobatch比較には`ahc015-128-microbatch-benchmark.ipynb`を使う。同一の128 channel
+checkpointとrolloutに対しglobal microbatch 256、512、1,024をT4 x2 DDPで測定し、学習runは開始しない。
+
 ## 旧モデルの未来列ablation
 
 64 channel化以前の144 channel・9 blockモデルが未来列を実際に利用していたかは、当時の15盤面特徴、
