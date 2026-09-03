@@ -118,6 +118,21 @@ caffeinate -i env PYTHONPATH=python .venv/bin/python \
 64 channel教師相当の初期方策は失われない。`--initialize-from`と、学習状態を丸ごと再開する
 `--resume`は同時には指定できない。
 
+## 旧モデルの未来列ablation
+
+64 channel化以前の144 channel・9 blockモデルが未来列を実際に利用していたかは、当時の15盤面特徴、
+左詰め未来列、未来MLP、FiLM、非線形fusionを再現した専用CLIで確認する。正しい未来列、ゼロ入力、
+episode間shuffle、残数を保った順序shuffleを、同一ケース上でMPSにより逐次評価する。
+
+```bash
+PYTHONPATH=python .venv/bin/python \
+  -m examples.ahc015.python.evaluate_legacy_future_ablation \
+  --checkpoint outputs/ahc015/ppo-20260825-105935/best.pt \
+  --episodes 2000 \
+  --seed 20260910 \
+  --device mps
+```
+
 ## 検証
 
 ```bash

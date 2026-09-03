@@ -42,11 +42,20 @@ from examples.ahc015.python.game import (
     afterstates,
     afterstates_batch,
     connectivity_numerator,
+    denominator,
     empty_board,
     place_at_rank,
     place_at_ranks,
     tilt,
     tilt_batch,
+)
+from examples.ahc015.python.legacy_future import (
+    LEGACY_BOARD_CHANNELS,
+    LEGACY_FUTURE_CHANNELS,
+    LEGACY_FUTURE_LENGTH,
+    LegacyFutureValueNet,
+    ablate_legacy_futures,
+    encode_legacy_afterstates,
 )
 from examples.ahc015.python.model import (
     STUDENT_CHANNELS,
@@ -469,6 +478,78 @@ def test_full_future_late_fusion_is_residual_and_action_dependent() -> None:
         )
     assert not torch.allclose(scores_a, scores_b)
     assert torch.equal(correction_off, expected)
+
+
+def test_legacy_future_encoding_and_ablation_modes() -> None:
+    flavors = np.resize(np.array([3, 1, 2], dtype=np.uint8), CELL_COUNT)
+    boards = np.repeat(empty_board()[None], ACTION_COUNT, axis=0)
+    boards[:, 3, 4] = 3
+    actions = np.arange(ACTION_COUNT)
+    placed = 7
+    denominators = np.repeat(denominator(flavors), ACTION_COUNT)
+    board_features, future_features, potentials = encode_legacy_afterstates(
+        boards,
+        actions,
+        placed,
+        np.repeat(flavors[None], ACTION_COUNT, axis=0),
+        denominators,
+    )
+    assert board_features.shape == (
+        ACTION_COUNT,
+        LEGACY_BOARD_CHANNELS,
+        SIDE,
+        SIDE,
+    )
+    assert future_features.shape == (
+        ACTION_COUNT,
+        LEGACY_FUTURE_CHANNELS,
+        LEGACY_FUTURE_LENGTH,
+    )
+    assert np.all(future_features[:, :, : CELL_COUNT - placed].sum(axis=1) == 1)
+    assert np.all(future_features[:, :, CELL_COUNT - placed :] == 0)
+    assert np.allclose(board_features[:, 14, 0, 0], potentials)
+
+    two_episodes = np.concatenate((future_features, future_features[:, [1, 2, 0]]))
+    permutation = np.array([1, 0])
+    shifted = ablate_legacy_futures(
+        two_episodes,
+        "episode_shuffle",
+        episode_permutation=permutation,
+        remaining_length=CELL_COUNT - placed,
+    )
+    assert np.array_equal(shifted[:ACTION_COUNT], two_episodes[ACTION_COUNT:])
+    zero = ablate_legacy_futures(
+        two_episodes,
+        "zero",
+        remaining_length=CELL_COUNT - placed,
+    )
+    assert not np.any(zero)
+    shuffled = ablate_legacy_futures(
+        two_episodes,
+        "order_shuffle",
+        order_priorities=np.random.default_rng(15041).random((2, CELL_COUNT)),
+        remaining_length=CELL_COUNT - placed,
+    )
+    assert np.array_equal(
+        shuffled.reshape(2, ACTION_COUNT, 3, CELL_COUNT)[:, 0].sum(axis=2),
+        two_episodes.reshape(2, ACTION_COUNT, 3, CELL_COUNT)[:, 0].sum(axis=2),
+    )
+
+
+def test_legacy_film_model_can_change_actions_with_future_input() -> None:
+    torch.manual_seed(15041)
+    model = LegacyFutureValueNet(channels=8, residual_blocks=2).eval()
+    torch.nn.init.normal_(model.output.weight, std=0.1)
+    boards = torch.randn(8, LEGACY_BOARD_CHANNELS, SIDE, SIDE)
+    future_a = torch.zeros(8, LEGACY_FUTURE_CHANNELS, LEGACY_FUTURE_LENGTH)
+    future_b = torch.randn(2, LEGACY_FUTURE_CHANNELS, LEGACY_FUTURE_LENGTH)
+    future_b = future_b.repeat_interleave(ACTION_COUNT, dim=0)
+    with torch.inference_mode():
+        scores_a = model(boards, future_a).reshape(2, ACTION_COUNT)
+        scores_b = model(boards, future_b).reshape(2, ACTION_COUNT)
+    centered_a = scores_a - scores_a[:, :1]
+    centered_b = scores_b - scores_b[:, :1]
+    assert not torch.allclose(centered_a, centered_b)
 
 
 def test_function_preserving_afterstate_widening_ignores_future_path() -> None:
