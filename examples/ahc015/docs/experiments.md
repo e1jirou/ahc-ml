@@ -1447,5 +1447,25 @@
 - 設定: `examples/ahc015/config_afterstate_128_continue.toml`
 - Notebook: `examples/ahc015/ahc015-128-ppo.ipynb`。本番前に同じresume経路を8局・1 iterationで検証する
 - W&B run名: `large-<時刻>`
-- microbatch: 暫定値512（GPUあたり256）。T4 x2で最適化済みではないため、本学習前に
-  `ahc015-128-microbatch-benchmark.ipynb`でglobal 256/512/1,024を同一rollout・各2回比較して確定する
+- microbatch benchmark: `ahc015-128-microbatch-benchmark.ipynb`でglobal 256/512/1,024
+  （GPUあたり128/256/512）を同一256-episode rollout・各2回比較した。更新25回の中央値は順に
+  21.860秒、21.716秒、21.459秒。1,024は512比1.012倍だったが、条件内の反復差が最大1.610秒あり、
+  条件間の最大差0.400秒を上回った
+- microbatch判断: 1,024がT4 x2のメモリに収まることは確認できたが、速度差は測定誤差内で追加実験の
+  価値は低い。メモリ余裕を残すglobal 512（GPUあたり256）を5時間学習に採用する
+
+## 2026-09-03 未来列なし128 channel・蒸留なしPPO 5時間（結果）
+
+- W&B: `large-20260903-083526`（run ID `bbsoay8q`）、正常終了
+- 実行時間: 5.084時間、epoch 23から63、追加16,220,160 environment transitions、15,840 update
+- 固定2,048ケース評価: 最初の更新後に754,845.812、最低742,215.057まで低下した後、終盤は
+  761,000前後まで回復。最終761,782.361 ±1,902.726で、開始点のrun内best 768,329.384は更新しなかった
+- PPO状態: 初期のapproximate KL 0.0223から最終0.00749、clip fraction 0.1234から0.0645へ安定。
+  explained varianceは最終0.9752で、数値的な発散はない
+- checkpoint: 終了時点の128 channel actor・critic・optimizerを含む`last.pt`（epoch 63、SHA-256
+  `aca6a0ee2b87ab7f22f13bda97db745b556dc3e82092fa309d3d37ad8314c67e`）を回収し、W&B artifact
+  `large-20260903-083526-last-training-checkpoint:v0`へ補完uploadした
+- 次段階: 上記lastから、学習率`3e-4`・entropy係数`0.01`などを維持し、rollout seedだけ`15043`へ
+  変更して10時間継続する。Notebookは`ahc015-128-ppo.ipynb`
+- 保存改善: 今後はrun終了時にbest actor、best training checkpointに加えてlast training checkpointも
+  W&B artifactへ自動uploadし、`last.pt`内部にも終了時の固定評価値を保存する

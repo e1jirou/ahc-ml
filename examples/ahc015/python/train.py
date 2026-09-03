@@ -442,6 +442,8 @@ def main() -> None:
     best_score = -math.inf
     phi_schedule_elapsed_offset = 0.0
     distillation_schedule_elapsed_offset = 0.0
+    resume_requires_initial_evaluation = False
+    resume_policy_phi_coefficient = config.ppo.policy_phi_coefficient_start
     if args.resume is not None:
         checkpoint = load_training_checkpoint(args.resume, model, optimizer, model_device)
         # Optimizer checkpoints also contain their old learning rate.  Keep the
@@ -465,6 +467,7 @@ def main() -> None:
                 config.ppo.policy_phi_coefficient_start,
             )
         )
+        resume_policy_phi_coefficient = checkpoint_phi_coefficient
         checkpoint_is_target_policy = math.isclose(
             checkpoint_phi_coefficient,
             config.ppo.policy_phi_coefficient_end,
@@ -472,6 +475,7 @@ def main() -> None:
         )
         if checkpoint_is_target_policy:
             best_score = float(checkpoint_metrics.get("evaluation/mean_score", -math.inf))
+            resume_requires_initial_evaluation = not math.isfinite(best_score)
         if math.isfinite(best_score):
             save_checkpoint(
                 output_dir / "best.pt",
@@ -560,6 +564,54 @@ def main() -> None:
         f"- Phi-greedy evaluation: {config.evaluation.phi_greedy_baseline}\n"
         f"- W&B: {config.wandb.mode}, run ID `{tracker.run_id}`\n",
     )
+
+    if resume_requires_initial_evaluation:
+        initial_metrics = evaluate(
+            evaluation_model,
+            model,
+            device,
+            config,
+            parallel_runtime,
+            resume_policy_phi_coefficient,
+        )
+        best_score = initial_metrics["evaluation/mean_score"]
+        initial_metrics.update(
+            {
+                "training/update": float(update),
+                "training/environment_transitions": float(environment_transitions),
+                "training/early_stop_count": float(early_stop_count),
+                "training/policy_phi_coefficient": resume_policy_phi_coefficient,
+                "training/policy_phi_schedule_elapsed_hours": phi_schedule_elapsed_offset,
+                "training/distillation_schedule_elapsed_hours": (
+                    distillation_schedule_elapsed_offset
+                ),
+            }
+        )
+        save_checkpoint(
+            output_dir / "best.pt",
+            model=model.actor,
+            optimizer=optimizer,
+            epoch=start_iteration - 1,
+            config=config_dict,
+            metrics=initial_metrics,
+        )
+        save_checkpoint(
+            output_dir / "best-training.pt",
+            model=model,
+            optimizer=optimizer,
+            epoch=start_iteration - 1,
+            config=config_dict,
+            metrics=initial_metrics,
+        )
+        tracker.log(initial_metrics, step=start_iteration - 1)
+        print(
+            f"initial resumed model mean score: {best_score:.3f} "
+            f"({config.evaluation.episodes} fixed cases)"
+        )
+        append_experiment_log(
+            log_path,
+            f"- initial resumed mean score: {best_score:.3f}\n",
+        )
 
     if initialization_checkpoint is not None:
         initial_metrics = evaluate(
@@ -892,6 +944,8 @@ def main() -> None:
                     + (time.monotonic() - training_started) / 3600,
                 )
             ),
+            "evaluation/mean_score": float(last_metrics["evaluation/mean_score"]),
+            "evaluation/score_se": float(last_metrics["evaluation/score_se"]),
             "evaluation/best_mean_score": best_score,
         },
     )
@@ -920,6 +974,11 @@ def main() -> None:
     tracker.log_artifact(
         output_dir / "best-training.pt",
         name=f"{run_name}-training-checkpoint",
+        artifact_type="model",
+    )
+    tracker.log_artifact(
+        output_dir / "last.pt",
+        name=f"{run_name}-last-training-checkpoint",
         artifact_type="model",
     )
     tracker.finish()

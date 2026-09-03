@@ -24,6 +24,8 @@ caffeinate -i env PYTHONPATH=python .venv/bin/python \
 
 ゼロから始めるときは`--resume`を付けない。`best.pt`はactor単体、`best-training.pt`はbest時点の
 actor・critic・optimizerを含む継続学習用checkpoint、`last.pt`は終了時点の完全な学習状態である。
+W&Bを有効にしたrunでは、終了時にbestだけでなく`last.pt`もlast training checkpoint artifactとして
+uploadする。
 wall-clock上限に達したiterationと最後の評価・checkpoint保存は完了させるため、実行時間は10時間を少し超える
 場合がある。
 
@@ -135,13 +137,16 @@ correctionを除いた盤面経路である。future入力は生成も使用も�
 
 ### 蒸留後のPPO継続
 
-`ahc015-128-ppo.ipynb`は、W&B run `distill-20260903-045216`の`best-training.pt`から、
-蒸留係数を0にして最初の5時間を継続する。future modeは`none`のまま、potential shaping、policy
-`alpha=0`を維持し、蒸留終了後は学習率`3e-4`・entropy係数`0.01`の通常PPO設定へ戻す。Kaggle T4 x2ではrollout・評価を
+最初の蒸留なしPPOはW&B run `distill-20260903-045216`のbestから5時間実行し、run
+`large-20260903-083526`の終了時点（epoch 63）まで進めた。`ahc015-128-ppo.ipynb`は、このrunの
+`last-training-checkpoint:v0`からさらに10時間継続する。future modeは`none`のまま、potential shaping、
+policy `alpha=0`、学習率`3e-4`、entropy係数`0.01`を維持する。Kaggle T4 x2ではrollout・評価を
 GPU別process、PPO更新を2-process DDP/NCCLで実行し、本番前に同じresume経路を短いsmoke testで
-確認する。設定は`config_afterstate_128_continue.toml`、W&B run名は`large-<時刻>`とする。
+確認する。設定は`config_afterstate_128_continue.toml`、seedは`15043`、W&B run名は`large-<時刻>`とする。
 本学習前のmicrobatch比較には`ahc015-128-microbatch-benchmark.ipynb`を使う。同一の128 channel
 checkpointとrolloutに対しglobal microbatch 256、512、1,024をT4 x2 DDPで測定し、学習runは開始しない。
+実測中央値はそれぞれ21.860秒、21.716秒、21.459秒で、条件内の反復差より小さかった。明確な高速化は
+確認できず、GPUあたり256となるglobal microbatch 512を維持する。
 
 ## 旧モデルの未来列ablation
 
