@@ -1469,3 +1469,19 @@
   変更して10時間継続する。Notebookは`ahc015-128-ppo.ipynb`
 - 保存改善: 今後はrun終了時にbest actor、best training checkpointに加えてlast training checkpointも
   W&B artifactへ自動uploadし、`last.pt`内部にも終了時の固定評価値を保存する
+
+## 2026-09-04 未来列なし128 channel・蒸留なしPPO 10時間（結果）
+
+- W&B: `large-20260903-141739`（run ID `bvok9tnw`）、正常終了
+- 実行時間: 10.048時間、epoch 63から145、追加33,251,328 environment transitions、32,472 update
+- 固定2,048ケース評価: 開始時761,782.361から、序盤は755,721.217まで低下したが、その後回復した。
+  6.87時間で773,502.399、7.36時間で774,921.207となり、最終評価がrun内bestの
+  779,071.038 ±1,761.048だった。開始点からの改善は+17,288.677
+- PPO状態: 最終approximate KL 0.00615、clip fraction 0.0539、explained variance 0.9797。
+  数値的な発散はなく、最終評価でbestを更新しているため、追加学習を止める根拠はまだない
+- checkpoint: `last.pt`はepoch 145、optimizer state 88 parameter分を保持し、SHA-256は
+  `4f7bc5520d4eed7dddb6b970f8c5c6edeb00fe151fe0979d99b9016b90913c36`。W&B artifact
+  `large-20260903-141739-last-training-checkpoint:v0`へupload済み。最終評価がbestのため、bestとlastは
+  同じepochのモデル状態である
+- 次段階: 上記lastから学習率`3e-4`・entropy係数`0.01`などを維持し、rollout seedを`15044`へ
+  変更して11時間30分継続する。Notebookは`ahc015-128-ppo.ipynb`
