@@ -238,13 +238,13 @@ def test_config_and_ppo_model_shapes() -> None:
     assert distill_config.run.name_prefix == "distill"
     continue_config = load_config(config_directory / "config_afterstate_128_continue.toml")
     assert continue_config.run.name_prefix == "large"
-    assert continue_config.run.seed == 15044
+    assert continue_config.run.seed == 15045
     assert continue_config.run.device == "cuda"
     assert continue_config.model.input_mode == "afterstate"
     assert continue_config.model.future_mode == "none"
     assert continue_config.model.channels == 128
     assert continue_config.model.residual_blocks == 10
-    assert continue_config.training.max_hours == 11.5
+    assert continue_config.training.max_hours == 10.0
     assert continue_config.training.rollout_episodes == 4096
     assert continue_config.training.data_parallel is True
     assert continue_config.training.rollout_processes == 2
