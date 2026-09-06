@@ -896,6 +896,8 @@ def main() -> None:
                 metrics=last_metrics,
             )
         final_metrics = {
+            "evaluation/mean_score": last_metrics["evaluation/mean_score"],
+            "evaluation/score_se": last_metrics["evaluation/score_se"],
             "final/mean_score": last_metrics["evaluation/mean_score"],
             "final/score_se": last_metrics["evaluation/score_se"],
         }

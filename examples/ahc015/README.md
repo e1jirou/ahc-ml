@@ -138,12 +138,12 @@ correctionを除いた盤面経路である。future入力は生成も使用も�
 ### 蒸留後のPPO継続
 
 最初の蒸留なしPPOはW&B run `distill-20260903-045216`のbestから5時間実行し、lastから10時間、
-さらに11時間30分継続してrun `large-20260904-005451`のepoch 233まで進めた。
+11時間30分、さらに10時間継続してrun `large-20260905-093954`のepoch 320まで進めた。
 `ahc015-128-ppo.ipynb`は、このrunの`last-training-checkpoint:v0`からさらに10時間継続する。
 future modeは`none`のまま、potential shaping、
 policy `alpha=0`、学習率`3e-4`、entropy係数`0.01`を維持する。Kaggle T4 x2ではrollout・評価を
 GPU別process、PPO更新を2-process DDP/NCCLで実行し、本番前に同じresume経路を短いsmoke testで
-確認する。設定は`config_afterstate_128_continue.toml`、seedは`15045`、W&B run名は`large-<時刻>`とする。
+確認する。設定は`config_afterstate_128_continue.toml`、seedは`15046`、W&B run名は`large-<時刻>`とする。
 本学習前のmicrobatch比較には`ahc015-128-microbatch-benchmark.ipynb`を使う。同一の128 channel
 checkpointとrolloutに対しglobal microbatch 256、512、1,024をT4 x2 DDPで測定し、学習runは開始しない。
 実測中央値はそれぞれ21.860秒、21.716秒、21.459秒で、条件内の反復差より小さかった。明確な高速化は

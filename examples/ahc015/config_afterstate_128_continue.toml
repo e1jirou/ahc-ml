@@ -1,5 +1,5 @@
 [run]
-seed = 15045
+seed = 15046
 device = "cuda"
 deterministic = false
 output_dir = "outputs/ahc015"
