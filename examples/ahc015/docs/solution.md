@@ -2,9 +2,9 @@
 
 ## 方針
 
-特徴量とモデル容量の過剰性を調べるため、入力は種類別占有と空きマスだけ、モデル幅は64 channelとする。
+入力は種類別占有と空きマスだけとし、提出モデルの幅は128 channelとする。
 傾斜前盤面を1回入力するpre-tilt版と、4方向の傾斜後盤面を1つずつ入力するafterstate版を同条件で比較し、
-約15時間の学習後に性能の高かったafterstate版を採用する。pre-tilt版は比較基準として実装を残す。
+約15時間の比較で性能の高かったafterstate版を採用する。
 
 ## 問題の定式化
 
@@ -35,8 +35,7 @@ temperature = 12
 ```
 
 とする。学習時はCategorical分布からsampleし、提出時は最大logitを決定的に選ぶ。temperatureは
-argmaxを変えない。初期のafterstate学習では`Phi(W_t^a) + G_theta`を用いたが、学習済みcheckpointから
-policy Phi係数を3時間かけて`1`から`0`へannealし、その後は`G_theta`だけで行動を選ぶ構成を採用した。
+argmaxを変えない。方策は`G_theta`だけで行動を選ぶ。
 したがって、候補4方向のPhiは方策・推論では計算しない。
 
 criticはactorと同じbackboneの別ネットワークで4候補を評価し、その平均を傾斜前状態の価値とする。
@@ -105,8 +104,8 @@ L = L_policy + value_coefficient * L_value - entropy_coefficient * entropy
 | transitions / iteration | 405,504 |
 | PPO epochs | 1 |
 | minibatch size | 1,024 |
-| GPU microbatch size | 128（8回の勾配蓄積でminibatch 1,024を維持） |
-| AdamW learning rate | `3e-4` |
+| GPU microbatch size | 512（2 GPUで各256、global microbatch 512） |
+| AdamW learning rate | `3e-4`（学習状況を見て減衰） |
 | weight decay | `1e-4` |
 | policy clip | `0.2` |
 | value clip | `0.2` |
@@ -139,10 +138,10 @@ pre-tilt版では傾斜前盤面の回転・反転8通りから辞書順最小�
 
 ## ネットワーク
 
-actorとcriticはそれぞれ別ネットワークで、同じ64 channel・10 blockのbackboneを使う。
+actorとcriticはそれぞれ別ネットワークで、同じ128 channel・10 blockのbackboneを使う。
 
 ```text
-width, blocks = (64, 10)
+width, blocks = (128, 10)
 
 board input (4, 10, 10):
     Conv 3x3, 4 -> width, ReLU
@@ -175,7 +174,20 @@ criticは4候補の出力平均を状態価値とする。これにより入力�
 afterstate版は16,656.832点高く、固定512ケースのbestでもpre-tilt版の`+401,973.766`に対して
 `+422,974.883`だった。afterstate版は4候補を評価するため計算量が大きく、累計transitionもpre-tilt版の
 99,348,480に対して44,199,936に留まるが、それでも同じwall-clock予算で性能が上回った。以上から、
-性能を優先する本解法ではafterstate版を採用し、pre-tilt版は高速な比較基準として残す。
+性能を優先する本解法ではafterstate版を採用する。
+
+## 提出用の追加探索
+
+提出器には、最良の128 channel afterstate actorをint8量子化して埋め込む。通常手はactorのargmaxを選び、
+終盤だけ追加探索で置き換える。
+
+- 94手目以降は、残り6手をexpectimaxで厳密評価する。将来の配置位置は全列挙し、各配置後は最大の方向を選ぶ。
+  transposition tableを用い、7手探索はtail latencyが2秒制限を超え得るため採用しない。
+- 88〜93手目は、初手4方向を24通りのルール方策（味の役割6 permutation × 盤面4 rotation）で各128回
+  モンテカルロ playout して比較する。各候補・ルールで同じ将来配置列を共有し、モデルの第一候補を覆すには
+  連結度分子で20以上の推定改善を要求する。
+- 固定sample上限に加え、残時間を残りのモンテカルロ手数で割ったdeadlineで打ち切る。`--mc-turns 0` と
+  `--exact-turns 0`でそれぞれ無効化できる。
 
 ## 実装上の確認事項
 

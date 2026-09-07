@@ -209,34 +209,28 @@ def test_teacher_is_about_four_times_the_student() -> None:
 
 def test_config_and_ppo_model_shapes() -> None:
     config_directory = Path(__file__).parents[2] / "examples" / "ahc015"
-    config = load_config(config_directory / "config.toml")
-    assert config.training.max_hours == 10.0
-    assert config.run.device == "mps"
-    assert config.model.channels == 64
-    assert config.model.residual_blocks == TEACHER_RESIDUAL_BLOCKS
-    assert config.training.rollout_episodes == 4096
-    assert config.training.batch_size == 1024
-    assert config.training.micro_batch_size == 128
-    assert config.training.rollout_processes == 1
-    assert config.training.learning_rate == 3e-4
-    assert config.ppo.gamma == 1.0
-    afterstate_config = load_config(config_directory / "config_afterstate.toml")
-    assert afterstate_config.model.input_mode == "afterstate"
-    assert afterstate_config.model.channels == 64
-    assert afterstate_config.model.residual_blocks == 10
-    assert afterstate_config.training.max_hours == 5.0
-    assert afterstate_config.evaluation.interval == 2
-    distill_config = load_config(config_directory / "config_afterstate_128_distill.toml")
+    distill_config = load_config(config_directory / "config_distill.toml")
     assert distill_config.model.future_mode == "none"
     assert distill_config.model.channels == 128
     assert distill_config.training.learning_rate == 1e-4
     assert distill_config.distillation.coefficient_start == 1.0
     assert distill_config.distillation.coefficient_end == 0.0
     assert distill_config.distillation.anneal_hours == 3.0
+    ppo_config = load_config(config_directory / "config_ppo.toml")
+    assert ppo_config.model.input_mode == "afterstate"
+    assert ppo_config.model.channels == 128
+    assert ppo_config.model.residual_blocks == 10
+    assert ppo_config.training.max_hours == 9.5
+    assert ppo_config.training.rollout_episodes == 4096
+    assert ppo_config.training.batch_size == 1024
+    assert ppo_config.training.micro_batch_size == 512
+    assert ppo_config.training.rollout_processes == 2
+    assert ppo_config.training.learning_rate == 2.5e-4
+    assert ppo_config.ppo.gamma == 1.0
     assert distill_config.training.data_parallel
     assert distill_config.training.rollout_processes == 2
     assert distill_config.run.name_prefix == "distill"
-    continue_config = load_config(config_directory / "config_afterstate_128_continue.toml")
+    continue_config = load_config(config_directory / "config_ppo.toml")
     assert continue_config.run.name_prefix == "large"
     assert continue_config.run.seed == 15047
     assert continue_config.run.device == "cuda"
@@ -260,116 +254,14 @@ def test_config_and_ppo_model_shapes() -> None:
     assert continue_config.evaluation.interval == 2
     assert continue_config.evaluation.episodes == 2048
     assert continue_config.wandb.mode == "online"
-    assert afterstate_config.evaluation.episodes == 2048
-    no_phi_config = load_config(config_directory / "config_afterstate_no_phi.toml")
-    assert no_phi_config.run.seed == 15031
-    assert no_phi_config.model.input_mode == "afterstate"
-    assert no_phi_config.training.max_hours == 10.0
-    assert no_phi_config.ppo.policy_phi_coefficient_start == 1.0
-    assert no_phi_config.ppo.policy_phi_coefficient_end == 0.0
-    assert no_phi_config.ppo.policy_phi_anneal_hours == 3.0
-    assert no_phi_config.evaluation.interval == 2
-    assert no_phi_config.evaluation.episodes == 2048
-    alpha0_config = load_config(config_directory / "config_afterstate_alpha0.toml")
-    assert alpha0_config.run.seed == 15034
-    assert alpha0_config.model.channels == 64
-    assert alpha0_config.model.residual_blocks == 10
-    assert alpha0_config.ppo.policy_phi_coefficient_start == 0.0
-    assert alpha0_config.ppo.policy_phi_coefficient_end == 0.0
-    assert alpha0_config.ppo.reward_mode == "potential_shaping"
-    assert alpha0_config.ppo.gae_lambda == 0.95
-    assert not alpha0_config.evaluation.phi_greedy_baseline
-    submission_config = load_config(config_directory / "config_afterstate_128.toml")
-    assert submission_config.run.seed == 15040
-    assert submission_config.model.input_mode == "afterstate"
-    assert submission_config.model.future_mode == "none"
-    assert submission_config.model.channels == 128
-    assert submission_config.model.residual_blocks == 10
-    assert submission_config.training.max_hours == 10.0
-    assert submission_config.ppo.policy_phi_coefficient_start == 0.0
-    assert submission_config.ppo.reward_mode == "potential_shaping"
-    assert submission_config.wandb.mode == "online"
-    future_add_config = load_config(config_directory / "config_afterstate_future_add.toml")
-    assert future_add_config.run.seed == 15036
-    assert future_add_config.model.input_mode == "afterstate"
-    assert future_add_config.model.future_mode == "full_add"
-    assert future_add_config.model.channels == 64
-    assert future_add_config.training.max_hours == 10.0
-    assert future_add_config.wandb.mode == "online"
-    future_late_config = load_config(config_directory / "config_afterstate_future_late.toml")
-    assert future_late_config.run.seed == 15037
-    assert future_late_config.model.input_mode == "afterstate"
-    assert future_late_config.model.future_mode == "full_late"
-    assert future_late_config.model.channels == 64
-    assert future_late_config.training.max_hours == 10.0
-    assert future_late_config.wandb.mode == "online"
-    terminal_config = load_config(config_directory / "config_afterstate_terminal.toml")
-    assert terminal_config.run.seed == 15033
-    assert terminal_config.model.channels == 64
-    assert terminal_config.model.residual_blocks == 10
-    assert terminal_config.ppo.policy_phi_coefficient_start == 0.0
-    assert terminal_config.ppo.policy_phi_coefficient_end == 0.0
-    assert terminal_config.ppo.reward_mode == "terminal"
-    assert terminal_config.ppo.gae_lambda == 1.0
-    assert not terminal_config.evaluation.phi_greedy_baseline
-    fine_tune_config = load_config(config_directory / "config_finetune.toml")
-    assert fine_tune_config.training.max_hours == 2.0
-    assert fine_tune_config.training.learning_rate == 2.5e-4
-    continue_config = load_config(config_directory / "config_continue.toml")
-    assert continue_config.run.seed == 15020
-    assert continue_config.training.max_hours == 10.0
-    assert continue_config.training.learning_rate == 2.5e-4
-    rollout_config = load_config(config_directory / "config_rollout1024.toml")
-    assert rollout_config.run.seed == 15021
-    assert rollout_config.training.max_hours == 8.0
-    assert rollout_config.training.rollout_episodes == 1024
-    assert rollout_config.training.batch_size == 1024
-    assert rollout_config.training.epochs == 2
-    higher_lr_config = load_config(config_directory / "config_rollout1024_lr3e4.toml")
-    assert higher_lr_config.run.seed == 15022
-    assert higher_lr_config.training.max_hours == 10.0
-    assert higher_lr_config.training.rollout_episodes == 1024
-    assert higher_lr_config.training.batch_size == 1024
-    assert higher_lr_config.training.epochs == 2
-    assert higher_lr_config.training.learning_rate == 3e-4
-    continued_config = load_config(config_directory / "config_rollout1024_continue_lr3e4.toml")
-    assert continued_config.run.seed == 15023
-    assert continued_config.training.max_hours == 10.0
-    assert continued_config.training.rollout_episodes == 1024
-    assert continued_config.training.batch_size == 1024
-    assert continued_config.training.epochs == 2
-    assert continued_config.training.learning_rate == 3e-4
-    continued_again_config = load_config(
-        config_directory / "config_rollout1024_continue2_lr3e4.toml"
-    )
-    assert continued_again_config.run.seed == 15024
-    assert continued_again_config.training.max_hours == 10.0
-    assert continued_again_config.training.rollout_episodes == 1024
-    assert continued_again_config.training.batch_size == 1024
-    assert continued_again_config.training.epochs == 2
-    assert continued_again_config.training.learning_rate == 3e-4
-    film_config = load_config(config_directory / "config_film.toml")
-    assert film_config.run.seed == 15025
-    assert film_config.training.max_hours == 10.0
-    assert film_config.training.rollout_episodes == 1024
-    assert film_config.training.batch_size == 1024
-    assert film_config.training.epochs == 2
-    assert film_config.training.learning_rate == 3e-4
-    rollout4096_config = load_config(config_directory / "config_rollout4096.toml")
-    assert rollout4096_config.run.seed == 15026
-    assert rollout4096_config.training.rollout_episodes == 4096
-    assert rollout4096_config.training.batch_size == 1024
-    assert rollout4096_config.training.epochs == 1
-    assert rollout4096_config.evaluation.interval == 1
-
     model = Ahc015PpoNet(STUDENT_CHANNELS, STUDENT_RESIDUAL_BLOCKS).eval()
     boards = torch.randn(2, BOARD_CHANNELS, SIDE, SIDE)
     potentials = torch.rand(2, ACTION_COUNT)
     with torch.inference_mode():
-        logits, values = model(boards, potentials, config.ppo.logit_scale)
+        logits, values = model(boards, potentials, ppo_config.ppo.logit_scale)
     assert logits.shape == (2, ACTION_COUNT)
     assert values.shape == (2,)
-    assert torch.allclose(logits, config.ppo.logit_scale * potentials)
+    assert torch.allclose(logits, ppo_config.ppo.logit_scale * potentials)
     assert torch.equal(values, torch.zeros(2))
 
 
@@ -479,10 +371,10 @@ def test_afterstate_policy_phi_coefficient_and_schedule() -> None:
     assert torch.allclose(logits_with_phi, 12.0 * (0.5 * potentials + residuals))
 
     config = load_config(
-        Path(__file__).parents[2] / "examples" / "ahc015" / "config_afterstate_no_phi.toml"
+        Path(__file__).parents[2] / "examples" / "ahc015" / "config_ppo.toml"
     )
-    assert scheduled_policy_phi_coefficient(config.ppo, 0.0) == 1.0
-    assert scheduled_policy_phi_coefficient(config.ppo, 1.5) == 0.5
+    assert scheduled_policy_phi_coefficient(config.ppo, 0.0) == 0.0
+    assert scheduled_policy_phi_coefficient(config.ppo, 1.5) == 0.0
     assert scheduled_policy_phi_coefficient(config.ppo, 3.0) == 0.0
     assert scheduled_policy_phi_coefficient(config.ppo, 8.0) == 0.0
 

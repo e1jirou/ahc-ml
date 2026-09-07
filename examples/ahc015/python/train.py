@@ -37,7 +37,7 @@ from .simulation import evaluate_policy, generate_cases
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the AHC015 policy with PPO")
-    parser.add_argument("--config", type=Path, default=Path("examples/ahc015/config.toml"))
+    parser.add_argument("--config", type=Path, default=Path("examples/ahc015/config_ppo.toml"))
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"))
     parser.add_argument("--iterations", type=int)
