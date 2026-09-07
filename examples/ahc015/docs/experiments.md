@@ -1520,3 +1520,21 @@
   `evaluation/*`にもlogし、summaryとlast checkpointを一致させる
 - 次段階: 上記lastから学習率`3e-4`・entropy係数`0.01`などを維持し、rollout seedを`15046`へ
   変更して10時間継続する。Notebookは`ahc015-128-ppo.ipynb`
+
+## 2026-09-07 未来列なし128 channel・蒸留なしPPO 10時間（結果）
+
+- W&B: `large-20260906-043823`（run ID `oiieuj16`）、正常終了
+- 実行時間: 10.097時間、epoch 320から402、追加33,251,328 environment transitions、32,472 update
+- 固定2,048ケース評価: 開始checkpointの791,250.972に対し、epoch 371（6.28時間）でrun内bestの
+  796,200.133 ±1,733.542、最終epoch 402で791,590.136 ±1,707.041だった。開始点に対してbestは
+  +4,949.161、lastは+339.164。前runのbest 792,080.117も+4,120.016更新した
+- PPO状態: 最終approximate KL 0.00558、clip fraction 0.0477、explained variance 0.9842、
+  rollout entropy 0.1627。数値的な発散はないが、best到達後の約3.8時間は横ばいで、lastはbestより
+  4,609.998低かった
+- checkpoint: W&Bのbest training checkpointはepoch 371。ユーザー指定に従い継続に用いる`last.pt`は
+  epoch 402、optimizer state 88 parameter分を保持し、SHA-256は
+  `2ff4648c0e014def55ee73f04f953a9915ded639b28eecc2b72fc7964557d76d`。artifactは
+  `large-20260906-043823-last-training-checkpoint:v0`
+- 次段階: 上記lastから9時間30分継続する。飽和に近づいた一方、KLは過大ではないため、大幅な減衰は
+  避けて学習率だけを`3e-4`から`2.5e-4`へ下げる。entropy係数`0.01`など他条件は維持し、rollout
+  seedを`15047`へ変更する。Notebookは`ahc015-128-ppo.ipynb`

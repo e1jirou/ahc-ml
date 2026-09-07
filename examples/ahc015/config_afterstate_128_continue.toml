@@ -1,5 +1,5 @@
 [run]
-seed = 15046
+seed = 15047
 device = "cuda"
 deterministic = false
 output_dir = "outputs/ahc015"
@@ -18,11 +18,11 @@ rollout_episodes = 4096
 epochs = 1
 batch_size = 1024
 micro_batch_size = 512
-learning_rate = 0.0003
+learning_rate = 0.00025
 weight_decay = 0.0001
 gradient_clip_norm = 1.0
 checkpoint_interval = 5
-max_hours = 10.0
+max_hours = 9.5
 inference_batch_size = 4096
 data_parallel = true
 rollout_processes = 2
