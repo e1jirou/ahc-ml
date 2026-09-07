@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
         help="model.bin or model.q8.bin passed to the Rust executable with --model",
     )
     parser.add_argument("--rust-workers", type=int, default=min(8, os.cpu_count() or 1))
+    parser.add_argument(
+        "--rust-exact-turns",
+        type=int,
+        default=6,
+        help="number of final decision turns evaluated by exact expectimax",
+    )
     return parser.parse_args()
 
 
@@ -56,12 +62,14 @@ def evaluate_rust_case(
     model_path: Path | None,
     flavors: np.ndarray,
     ranks: np.ndarray,
+    exact_turns: int,
 ) -> int:
     input_lines = [" ".join(map(str, flavors.tolist()))]
     input_lines.extend(map(str, ranks.tolist()))
     command = [str(executable)]
     if model_path is not None:
         command.extend(("--model", str(model_path)))
+    command.extend(("--exact-turns", str(exact_turns)))
     completed = subprocess.run(
         command,
         input=("\n".join(input_lines) + "\n").encode(),
@@ -87,6 +95,7 @@ def evaluate_rust_policy(
     flavors: np.ndarray,
     ranks: np.ndarray,
     workers: int,
+    exact_turns: int,
 ) -> np.ndarray:
     if workers <= 0:
         raise ValueError("--rust-workers must be positive")
@@ -99,7 +108,7 @@ def evaluate_rust_policy(
             raise FileNotFoundError(model_path)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         scores = executor.map(
-            lambda case: evaluate_rust_case(executable, model_path, *case),
+            lambda case: evaluate_rust_case(executable, model_path, *case, exact_turns),
             zip(flavors, ranks, strict=True),
         )
         return np.fromiter(scores, dtype=np.int64, count=len(flavors))
@@ -111,6 +120,8 @@ def main() -> None:
         raise ValueError("--episodes must be positive")
     if args.rust_model is not None and args.rust_executable is None:
         raise ValueError("--rust-model requires --rust-executable")
+    if not 0 <= args.rust_exact_turns <= 10:
+        raise ValueError("--rust-exact-turns must be in [0, 10]")
     device, _ = select_device(args.device)
     flavors, ranks = generate_cases(args.episodes, args.seed)
     checkpoint = None
@@ -118,9 +129,7 @@ def main() -> None:
     if args.checkpoint is not None:
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         phi_greedy_baseline = bool(
-            checkpoint.get("config", {})
-            .get("evaluation", {})
-            .get("phi_greedy_baseline", True)
+            checkpoint.get("config", {}).get("evaluation", {}).get("phi_greedy_baseline", True)
         )
     random_result = evaluate_random_policy(flavors, ranks, seed=args.seed + 1)
     reports = [summarize("random", random_result.scores)]
@@ -142,9 +151,7 @@ def main() -> None:
             output_size = checkpoint["model_state_dict"]["output.weight"].shape[0]
             input_mode = "afterstate" if output_size == 1 else "pretilt"
         if input_mode == "afterstate":
-            future_mode = (
-                checkpoint.get("config", {}).get("model", {}).get("future_mode", "none")
-            )
+            future_mode = checkpoint.get("config", {}).get("model", {}).get("future_mode", "none")
             model = AfterstateValueNet(channels, residual_blocks, future_mode).to(device)
             learned_evaluator = evaluate_afterstate_policy
         else:
@@ -191,6 +198,7 @@ def main() -> None:
             flavors,
             ranks,
             args.rust_workers,
+            args.rust_exact_turns,
         )
         report = summarize("rust-quantized", rust_scores)
         if greedy is not None:

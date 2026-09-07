@@ -171,3 +171,21 @@ PYTHONPATH=python .venv/bin/python \
 PYTHONPATH=python .venv/bin/python -m pytest python/tests
 cargo test --workspace
 ```
+
+## 提出用終盤厳密探索
+
+提出器は評価が最良の128 channel・10 block afterstate actorを量子化して使用し、既定では96手目ではなく
+94手目の配置後から、残る6回のランダム配置をexpectimaxで厳密評価する。未来の配置位置は全て列挙して
+和を取り、各配置後の4方向は最大を選ぶ。全候補で確率分母が共通なので、葉の連結度分子の整数和だけを
+比較する。`--exact-turns 0`で無効化でき、`--exact-turns N`で0から10まで実験できる。
+
+```bash
+PYTHONPATH=python .venv/bin/python -m examples.ahc015.python.export \
+  --checkpoint outputs/ahc015/submission-search/checkpoint/best-training.pt \
+  --output outputs/ahc015/submission-search/model.bin \
+  --quantized-output outputs/ahc015/submission-search/model.q8.bin \
+  --rust-output examples/ahc015/rust/src/generated_model.rs
+cargo build --release -p ahc015-inference
+scripts/build_submit.sh examples/ahc015/rust/src/main.rs \
+  outputs/ahc015/submission-search/submit.rs
+```

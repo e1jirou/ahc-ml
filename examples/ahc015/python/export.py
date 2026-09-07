@@ -7,13 +7,11 @@ import torch
 from ahc_ml.checkpoint import load_checkpoint
 from ahc_ml.export import export_quantized_state_dict, export_state_dict
 
-from .model import (
-    STUDENT_CHANNELS,
-    STUDENT_RESIDUAL_BLOCKS,
-    Ahc015ValueNet,
-    dimensions_from_state_dict,
-    parameter_count,
-)
+from .afterstate_model import AfterstateValueNet, parameter_count
+from .model import dimensions_from_state_dict
+
+SUBMISSION_CHANNELS = 128
+SUBMISSION_RESIDUAL_BLOCKS = 10
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,21 +37,29 @@ def main() -> None:
     torch.manual_seed(args.seed)
     if args.checkpoint is not None:
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        channels, residual_blocks = dimensions_from_state_dict(checkpoint["model_state_dict"])
+        state_dict = checkpoint["model_state_dict"]
+        prefix = "actor." if "actor.board_stem.weight" in state_dict else ""
+        channels, residual_blocks = dimensions_from_state_dict(state_dict, prefix=prefix)
     else:
-        channels, residual_blocks = STUDENT_CHANNELS, STUDENT_RESIDUAL_BLOCKS
-    if (channels, residual_blocks) != (STUDENT_CHANNELS, STUDENT_RESIDUAL_BLOCKS):
-        raise ValueError(
-            "Rust export only supports the 128-channel, 8-block student model; "
-            "distill the teacher before exporting"
-        )
-    model = Ahc015ValueNet(channels, residual_blocks)
+        channels, residual_blocks = SUBMISSION_CHANNELS, SUBMISSION_RESIDUAL_BLOCKS
+    if (channels, residual_blocks) != (SUBMISSION_CHANNELS, SUBMISSION_RESIDUAL_BLOCKS):
+        raise ValueError("Rust export only supports the 128-channel, 10-block afterstate model")
+    model = AfterstateValueNet(channels, residual_blocks, "none")
     if args.checkpoint is not None:
-        load_checkpoint(args.checkpoint, model=model)
+        if prefix:
+            model.load_state_dict(
+                {
+                    name.removeprefix(prefix): value
+                    for name, value in state_dict.items()
+                    if name.startswith(prefix)
+                }
+            )
+        else:
+            load_checkpoint(args.checkpoint, model=model)
 
     parameters = parameter_count(model)
     metadata = {
-        "architecture": f"ahc015-ppo-actor-{channels}x{residual_blocks}-film-v3",
+        "architecture": f"ahc015-afterstate-{channels}x{residual_blocks}-occupancy-v1",
         "training_algorithm": "ppo",
         "channels": channels,
         "residual_blocks": residual_blocks,

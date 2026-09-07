@@ -1,15 +1,8 @@
 use crate::game::{
     ACTION_COUNT, Action, BACK, Board, CANDY_COUNT, FRONT, Input, LEFT, RIGHT, SIDE, cell,
-    potential,
 };
 
-pub const FEATURE_CHANNELS: usize = 15;
-const BOARD_CHANNELS: usize = 12;
-const COMPONENT_CHANNEL_START: usize = 4;
-const TURN_CHANNEL: usize = 7;
-const REMAINING_CHANNEL_START: usize = 8;
-const POTENTIAL_CHANNEL: usize = 11;
-const SEQUENCE_CHANNEL_START: usize = BOARD_CHANNELS;
+pub const FEATURE_CHANNELS: usize = 4;
 
 pub fn encode_candidates(boards: &[Board; ACTION_COUNT], placed: usize, input: &Input) -> Vec<f32> {
     let mut output = vec![0.0; ACTION_COUNT * FEATURE_CHANNELS * CANDY_COUNT];
@@ -36,49 +29,6 @@ fn encode_one(
         let channel = if flavor == 0 { 3 } else { flavor as usize - 1 };
         output[sample_base + channel * CANDY_COUNT + index] = 1.0;
     }
-
-    let component_planes = component_size_planes(&board);
-    for flavor in 0..3 {
-        let channel_base = sample_base + (COMPONENT_CHANNEL_START + flavor) * CANDY_COUNT;
-        output[channel_base..channel_base + CANDY_COUNT].copy_from_slice(&component_planes[flavor]);
-    }
-
-    fill_plane(
-        output,
-        sample_base,
-        TURN_CHANNEL,
-        placed as f32 / CANDY_COUNT as f32,
-    );
-    let mut remaining = [0; 3];
-    for &flavor in &input.flavors()[placed..] {
-        remaining[flavor as usize - 1] += 1;
-    }
-    for original in 0..3 {
-        let canonical = mapping[original + 1] as usize - 1;
-        fill_plane(
-            output,
-            sample_base,
-            REMAINING_CHANNEL_START + canonical,
-            remaining[original] as f32 / CANDY_COUNT as f32,
-        );
-    }
-    fill_plane(
-        output,
-        sample_base,
-        POTENTIAL_CHANNEL,
-        potential(&board, input.denominator()),
-    );
-
-    for position in placed..CANDY_COUNT {
-        let original = input.flavors()[position] as usize;
-        let canonical = mapping[original] as usize - 1;
-        output[sample_base + (SEQUENCE_CHANNEL_START + canonical) * CANDY_COUNT + position] = 1.0;
-    }
-}
-
-fn fill_plane(output: &mut [f32], sample_base: usize, channel: usize, value: f32) {
-    let start = sample_base + channel * CANDY_COUNT;
-    output[start..start + CANDY_COUNT].fill(value);
 }
 
 pub fn dynamic_flavor_mapping(input: &Input, placed: usize) -> [u8; 4] {
@@ -151,56 +101,6 @@ fn mirror_is_smaller(board: &Board) -> bool {
         }
     }
     false
-}
-
-fn component_size_planes(board: &Board) -> [[f32; CANDY_COUNT]; 3] {
-    let mut planes = [[0.0; CANDY_COUNT]; 3];
-    let mut visited = [false; CANDY_COUNT];
-    let mut stack = [0usize; CANDY_COUNT];
-    let mut component = [0usize; CANDY_COUNT];
-    for start in 0..CANDY_COUNT {
-        let flavor = board[start];
-        if flavor == 0 || visited[start] {
-            continue;
-        }
-        let mut stack_size = 1;
-        let mut component_size = 0;
-        stack[0] = start;
-        visited[start] = true;
-        while stack_size > 0 {
-            stack_size -= 1;
-            let current = stack[stack_size];
-            component[component_size] = current;
-            component_size += 1;
-            let row = current / SIDE;
-            let column = current % SIDE;
-            let mut neighbors = [usize::MAX; 4];
-            if row > 0 {
-                neighbors[0] = cell(row - 1, column);
-            }
-            if row + 1 < SIDE {
-                neighbors[1] = cell(row + 1, column);
-            }
-            if column > 0 {
-                neighbors[2] = cell(row, column - 1);
-            }
-            if column + 1 < SIDE {
-                neighbors[3] = cell(row, column + 1);
-            }
-            for next in neighbors {
-                if next != usize::MAX && !visited[next] && board[next] == flavor {
-                    visited[next] = true;
-                    stack[stack_size] = next;
-                    stack_size += 1;
-                }
-            }
-        }
-        let value = component_size as f32 / CANDY_COUNT as f32;
-        for &index in &component[..component_size] {
-            planes[flavor as usize - 1][index] = value;
-        }
-    }
-    planes
 }
 
 #[cfg(test)]

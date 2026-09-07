@@ -6,11 +6,9 @@ use crate::Tensor;
 
 const SIDE: usize = 10;
 const CELLS: usize = SIDE * SIDE;
-const FEATURE_CHANNELS: usize = 15;
-const SPATIAL_CHANNELS: usize = 12;
-const SEQUENCE_CHANNELS: usize = 3;
+const FEATURE_CHANNELS: usize = 4;
 const CHANNELS: usize = 128;
-const BLOCKS: usize = 8;
+const BLOCKS: usize = 10;
 
 struct Linear {
     weight: Array2<f32>,
@@ -25,16 +23,12 @@ struct ResidualBlock {
 
 /// Fixed AHC015 afterstate residual-value network.
 ///
-/// Input is contiguous board `(N, 12, 10, 10)` followed by future sequence
-/// `(N, 3, 100)`. The returned value is the learned residual `G(W)`; callers
-/// add the analytic connectedness potential.
+/// Input is contiguous board `(N, 4, 10, 10)`. The returned value is the
+/// learned afterstate score used directly for action selection.
 pub struct Ahc015ValueNet {
     stem_weight: Array4<f32>,
     stem_bias: Array1<f32>,
     blocks: Vec<ResidualBlock>,
-    future_fc1: Linear,
-    future_fc2: Linear,
-    film: Linear,
     output: Linear,
 }
 
@@ -93,7 +87,7 @@ fn take_linear(
 }
 
 impl Ahc015ValueNet {
-    pub const PARAMETER_COUNT: usize = 244_481;
+    pub const PARAMETER_COUNT: usize = 182_785;
     pub const INPUT_LENGTH: usize = FEATURE_CHANNELS * CELLS;
 
     pub fn from_tensors(mut tensors: HashMap<String, Tensor>) -> Result<Self, String> {
@@ -101,7 +95,7 @@ impl Ahc015ValueNet {
             .values
             .into_dimensionality::<Ix4>()
             .map_err(|error| format!("invalid board_stem.weight: {error}"))?;
-        if stem_weight.dim() != (CHANNELS, SPATIAL_CHANNELS, 3, 3) {
+        if stem_weight.dim() != (CHANNELS, FEATURE_CHANNELS, 3, 3) {
             return Err(format!(
                 "invalid shape for board_stem.weight: {:?}",
                 stem_weight.dim()
@@ -159,14 +153,6 @@ impl Ahc015ValueNet {
             });
         }
 
-        let future_fc1 = take_linear(
-            &mut tensors,
-            "future_fc1",
-            CHANNELS,
-            SEQUENCE_CHANNELS * CELLS,
-        )?;
-        let future_fc2 = take_linear(&mut tensors, "future_fc2", CHANNELS, CHANNELS)?;
-        let film = take_linear(&mut tensors, "film", CHANNELS * 2, CHANNELS)?;
         let output = take_linear(&mut tensors, "output", 1, CHANNELS)?;
 
         if !tensors.is_empty() {
@@ -179,9 +165,6 @@ impl Ahc015ValueNet {
             stem_weight,
             stem_bias,
             blocks,
-            future_fc1,
-            future_fc2,
-            film,
             output,
         })
     }
@@ -199,13 +182,13 @@ impl Ahc015ValueNet {
         let rows = batch * CELLS;
 
         // im2col gives the stem one matrix multiplication for the whole batch.
-        let mut columns = Array2::<f32>::zeros((rows, SPATIAL_CHANNELS * 9));
+        let mut columns = Array2::<f32>::zeros((rows, FEATURE_CHANNELS * 9));
         for sample in 0..batch {
             let sample_base = sample * Self::INPUT_LENGTH;
             for y in 0..SIDE {
                 for x in 0..SIDE {
                     let row = sample * CELLS + y * SIDE + x;
-                    for channel in 0..SPATIAL_CHANNELS {
+                    for channel in 0..FEATURE_CHANNELS {
                         let channel_base = sample_base + channel * CELLS;
                         for kernel_y in 0..3 {
                             let input_y = y as isize + kernel_y as isize - 1;
@@ -228,37 +211,10 @@ impl Ahc015ValueNet {
         let stem_matrix = self
             .stem_weight
             .view()
-            .into_shape_with_order((CHANNELS, SPATIAL_CHANNELS * 9))
+            .into_shape_with_order((CHANNELS, FEATURE_CHANNELS * 9))
             .expect("validated stem shape");
         let mut activation = columns.dot(&stem_matrix.t());
         add_bias_relu(&mut activation, &self.stem_bias);
-
-        let mut future = Array2::<f32>::zeros((batch, SEQUENCE_CHANNELS * CELLS));
-        for sample in 0..batch {
-            let sample_base = sample * Self::INPUT_LENGTH;
-            for channel in 0..SEQUENCE_CHANNELS {
-                let source = sample_base + (SPATIAL_CHANNELS + channel) * CELLS;
-                let destination = channel * CELLS;
-                for cell in 0..CELLS {
-                    future[(sample, destination + cell)] = input[source + cell];
-                }
-            }
-        }
-        let future = linear_relu(future, &self.future_fc1);
-        let future = linear_relu(future, &self.future_fc2);
-        let mut film = future.dot(&self.film.weight.t());
-        add_bias(&mut film, &self.film.bias);
-        for sample in 0..batch {
-            for cell in 0..CELLS {
-                let row = sample * CELLS + cell;
-                for channel in 0..CHANNELS {
-                    let gamma = film[(sample, channel)];
-                    let beta = film[(sample, CHANNELS + channel)];
-                    activation[(row, channel)] =
-                        activation[(row, channel)] * (1.0 + gamma) + beta;
-                }
-            }
-        }
 
         for block in &self.blocks {
             let mut depthwise = Array2::<f32>::zeros((rows, CHANNELS));
@@ -336,12 +292,6 @@ fn add_bias(values: &mut Array2<f32>, bias: &Array1<f32>) {
     }
 }
 
-fn linear_relu(input: Array2<f32>, layer: &Linear) -> Array2<f32> {
-    let mut output = input.dot(&layer.weight.t());
-    add_bias_relu(&mut output, &layer.bias);
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,7 +307,7 @@ mod tests {
         let mut tensors = HashMap::new();
         tensors.insert(
             "board_stem.weight".to_string(),
-            tensor(&[CHANNELS, SPATIAL_CHANNELS, 3, 3], 0.0),
+            tensor(&[CHANNELS, FEATURE_CHANNELS, 3, 3], 0.0),
         );
         tensors.insert("board_stem.bias".to_string(), tensor(&[CHANNELS], 0.0));
         for block in 0..BLOCKS {
@@ -378,21 +328,6 @@ mod tests {
                 tensor(&[CHANNELS], 0.0),
             );
         }
-        tensors.insert(
-            "future_fc1.weight".to_string(),
-            tensor(&[CHANNELS, SEQUENCE_CHANNELS * CELLS], 0.0),
-        );
-        tensors.insert("future_fc1.bias".to_string(), tensor(&[CHANNELS], 0.0));
-        tensors.insert(
-            "future_fc2.weight".to_string(),
-            tensor(&[CHANNELS, CHANNELS], 0.0),
-        );
-        tensors.insert("future_fc2.bias".to_string(), tensor(&[CHANNELS], 0.0));
-        tensors.insert(
-            "film.weight".to_string(),
-            tensor(&[CHANNELS * 2, CHANNELS], 0.0),
-        );
-        tensors.insert("film.bias".to_string(), tensor(&[CHANNELS * 2], 0.0));
         tensors.insert("output.weight".to_string(), tensor(&[1, CHANNELS], 0.0));
         tensors.insert("output.bias".to_string(), tensor(&[1], 0.0));
         tensors
@@ -400,15 +335,9 @@ mod tests {
 
     #[test]
     fn standard_parameter_count_is_stable() {
-        let count = CHANNELS * SPATIAL_CHANNELS * 9
+        let count = CHANNELS * FEATURE_CHANNELS * 9
             + CHANNELS
             + BLOCKS * (CHANNELS * 9 + CHANNELS + CHANNELS * CHANNELS + CHANNELS)
-            + CHANNELS * SEQUENCE_CHANNELS * CELLS
-            + CHANNELS
-            + CHANNELS * CHANNELS
-            + CHANNELS
-            + CHANNELS * 2 * CHANNELS
-            + CHANNELS * 2
             + CHANNELS
             + 1;
         assert_eq!(count, Ahc015ValueNet::PARAMETER_COUNT);

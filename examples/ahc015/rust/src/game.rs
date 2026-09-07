@@ -25,7 +25,6 @@ pub struct Input {
     flavors: [u8; CANDY_COUNT],
     totals: [usize; 3],
     first_positions: [usize; 3],
-    denominator: usize,
 }
 
 impl Input {
@@ -38,12 +37,10 @@ impl Input {
             totals[flavor] += 1;
             first_positions[flavor] = first_positions[flavor].min(index);
         }
-        let denominator = totals.iter().map(|count| count * count).sum();
         Self {
             flavors,
             totals,
             first_positions,
-            denominator,
         }
     }
 
@@ -57,10 +54,6 @@ impl Input {
 
     pub fn first_positions(&self) -> [usize; 3] {
         self.first_positions
-    }
-
-    pub fn denominator(&self) -> usize {
-        self.denominator
     }
 }
 
@@ -171,6 +164,21 @@ pub fn tilt(board: &Board, action: Action) -> Board {
     result
 }
 
+pub fn place_on_board_at_rank(board: &Board, rank: usize, flavor: u8) -> Board {
+    let mut result = *board;
+    let mut empty_rank = 0;
+    for cell in &mut result {
+        if *cell == 0 {
+            empty_rank += 1;
+            if empty_rank == rank {
+                *cell = flavor;
+                return result;
+            }
+        }
+    }
+    panic!("rank {rank} does not identify an empty cell");
+}
+
 pub fn connectivity_numerator(board: &Board) -> usize {
     let mut visited = [false; CANDY_COUNT];
     let mut stack = [0usize; CANDY_COUNT];
@@ -214,10 +222,6 @@ pub fn connectivity_numerator(board: &Board) -> usize {
         numerator += component_size * component_size;
     }
     numerator
-}
-
-pub fn potential(board: &Board, denominator: usize) -> f32 {
-    connectivity_numerator(board) as f32 / denominator as f32
 }
 
 #[cfg(test)]
