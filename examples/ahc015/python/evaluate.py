@@ -46,6 +46,13 @@ def parse_args() -> argparse.Namespace:
         default=6,
         help="number of final decision turns evaluated by exact expectimax",
     )
+    parser.add_argument("--rust-mc-turns", type=int, default=12)
+    parser.add_argument("--rust-mc-actions", type=int, default=4)
+    parser.add_argument("--rust-mc-samples", type=int, default=128)
+    parser.add_argument("--rust-mc-min-gain", type=float, default=20.0)
+    parser.add_argument("--rust-mc-strategy", choices=("equal", "halving"), default="equal")
+    parser.add_argument("--rust-time-limit-ms", type=int, default=1900)
+    parser.add_argument("--rust-time-reserve-ms", type=int, default=200)
     return parser.parse_args()
 
 
@@ -63,6 +70,13 @@ def evaluate_rust_case(
     flavors: np.ndarray,
     ranks: np.ndarray,
     exact_turns: int,
+    mc_turns: int,
+    mc_actions: int,
+    mc_samples: int,
+    mc_min_gain: float,
+    mc_strategy: str,
+    time_limit_ms: int,
+    time_reserve_ms: int,
 ) -> int:
     input_lines = [" ".join(map(str, flavors.tolist()))]
     input_lines.extend(map(str, ranks.tolist()))
@@ -70,6 +84,13 @@ def evaluate_rust_case(
     if model_path is not None:
         command.extend(("--model", str(model_path)))
     command.extend(("--exact-turns", str(exact_turns)))
+    command.extend(("--mc-turns", str(mc_turns)))
+    command.extend(("--mc-actions", str(mc_actions)))
+    command.extend(("--mc-samples", str(mc_samples)))
+    command.extend(("--mc-min-gain", str(mc_min_gain)))
+    command.extend(("--mc-strategy", mc_strategy))
+    command.extend(("--time-limit-ms", str(time_limit_ms)))
+    command.extend(("--time-reserve-ms", str(time_reserve_ms)))
     completed = subprocess.run(
         command,
         input=("\n".join(input_lines) + "\n").encode(),
@@ -96,6 +117,13 @@ def evaluate_rust_policy(
     ranks: np.ndarray,
     workers: int,
     exact_turns: int,
+    mc_turns: int = 12,
+    mc_actions: int = 4,
+    mc_samples: int = 128,
+    mc_min_gain: float = 20.0,
+    mc_strategy: str = "equal",
+    time_limit_ms: int = 1900,
+    time_reserve_ms: int = 200,
 ) -> np.ndarray:
     if workers <= 0:
         raise ValueError("--rust-workers must be positive")
@@ -108,7 +136,19 @@ def evaluate_rust_policy(
             raise FileNotFoundError(model_path)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         scores = executor.map(
-            lambda case: evaluate_rust_case(executable, model_path, *case, exact_turns),
+            lambda case: evaluate_rust_case(
+                executable,
+                model_path,
+                *case,
+                exact_turns,
+                mc_turns,
+                mc_actions,
+                mc_samples,
+                mc_min_gain,
+                mc_strategy,
+                time_limit_ms,
+                time_reserve_ms,
+            ),
             zip(flavors, ranks, strict=True),
         )
         return np.fromiter(scores, dtype=np.int64, count=len(flavors))
@@ -122,6 +162,16 @@ def main() -> None:
         raise ValueError("--rust-model requires --rust-executable")
     if not 0 <= args.rust_exact_turns <= 10:
         raise ValueError("--rust-exact-turns must be in [0, 10]")
+    if not 0 <= args.rust_mc_turns <= 100:
+        raise ValueError("--rust-mc-turns must be in [0, 100]")
+    if not 1 <= args.rust_mc_actions <= 4:
+        raise ValueError("--rust-mc-actions must be in [1, 4]")
+    if args.rust_mc_samples < 0:
+        raise ValueError("--rust-mc-samples must be nonnegative")
+    if args.rust_mc_min_gain < 0:
+        raise ValueError("--rust-mc-min-gain must be nonnegative")
+    if not 0 <= args.rust_time_reserve_ms < args.rust_time_limit_ms:
+        raise ValueError("Rust time reserve must be nonnegative and smaller than the limit")
     device, _ = select_device(args.device)
     flavors, ranks = generate_cases(args.episodes, args.seed)
     checkpoint = None
@@ -199,6 +249,13 @@ def main() -> None:
             ranks,
             args.rust_workers,
             args.rust_exact_turns,
+            args.rust_mc_turns,
+            args.rust_mc_actions,
+            args.rust_mc_samples,
+            args.rust_mc_min_gain,
+            args.rust_mc_strategy,
+            args.rust_time_limit_ms,
+            args.rust_time_reserve_ms,
         )
         report = summarize("rust-quantized", rust_scores)
         if greedy is not None:

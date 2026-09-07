@@ -189,3 +189,15 @@ cargo build --release -p ahc015-inference
 scripts/build_submit.sh examples/ahc015/rust/src/main.rs \
   outputs/ahc015/submission-search/submit.rs
 ```
+
+## 提出用モンテカルロ終盤探索
+
+既定では終盤12ターンのwindowに入り、厳密探索を始める94手目より前の88〜93手目でモンテカルロ探索を
+行う。初手4方向について、味の役割6 permutation × 盤面の4 rotationからなる24通りのルール方策を
+各128回playoutする。1つのsampleから生成した将来配置rank列は全候補・全ルールで共有する。
+味0が連続する間は、次の異なる味が1なら右、2なら左へ傾け、実際の0→1/2境界では下へ傾ける。
+
+各方向の最良ルールを比較し、モデル1位を変更するには終端連結度分子で20以上の推定改善を要求する。
+探索は固定128 sampleを上限としつつ、全体1.9秒から0.2秒を予約し、残時間を残りのモンテカルロ手数で
+割ったturn deadlineでも打ち切る。`--mc-turns 0`で無効化できる。均等samplingに加えて
+`--mc-strategy halving`も比較用に残している。
