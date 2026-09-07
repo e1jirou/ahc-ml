@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rust-exact-turns",
         type=int,
-        default=6,
+        default=7,
         help="number of final decision turns evaluated by exact expectimax",
     )
     parser.add_argument("--rust-mc-turns", type=int, default=12)

@@ -4,6 +4,7 @@ mod generated_model;
 
 use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, BufRead, Write};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -16,7 +17,32 @@ use crate::game::{
     connectivity_numerator, place_on_board_at_rank, tilt,
 };
 
-const DEFAULT_EXACT_TURNS: usize = 6;
+const DEFAULT_EXACT_TURNS: usize = 7;
+
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        const MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.0 = (self.0.rotate_left(5) ^ u64::from_ne_bytes(*chunk)).wrapping_mul(MULTIPLIER);
+        }
+        if !remainder.is_empty() {
+            let mut tail = [0; 8];
+            tail[..remainder.len()].copy_from_slice(remainder);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_ne_bytes(tail)).wrapping_mul(MULTIPLIER);
+        }
+        self.0 ^= bytes.len() as u64;
+    }
+}
+
+type ExactCache = HashMap<Board, usize, BuildHasherDefault<FastHasher>>;
 
 #[derive(Clone, Copy, PartialEq)]
 enum McStrategy {
@@ -181,6 +207,7 @@ fn choose_action(
     rule_actions: &[[u8; CANDY_COUNT]; 24],
     settings: &SearchSettings,
     started: Instant,
+    exact_cache: &mut ExactCache,
 ) -> Result<usize, String> {
     if state.is_terminal() {
         return Ok(FRONT);
@@ -189,9 +216,8 @@ fn choose_action(
     if settings.exact_turns > 0 && state.placed() >= CANDY_COUNT - settings.exact_turns {
         let mut best_action = FRONT;
         let mut best_sum = 0;
-        let mut cache = HashMap::new();
         for action in 0..ACTION_COUNT {
-            let sum = exact_future_sum(&candidates[action], state.placed(), input, &mut cache);
+            let sum = exact_future_sum(&candidates[action], state.placed(), input, exact_cache);
             if sum > best_sum {
                 best_sum = sum;
                 best_action = action;
@@ -458,16 +484,11 @@ fn splitmix64(mut value: u64) -> u64 {
 
 /// Sum of terminal connectivity numerators over every equally likely future
 /// placement sequence, assuming optimal actions after each revealed placement.
-fn exact_future_sum(
-    board: &Board,
-    placed: usize,
-    input: &Input,
-    cache: &mut HashMap<(Board, usize), usize>,
-) -> usize {
+fn exact_future_sum(board: &Board, placed: usize, input: &Input, cache: &mut ExactCache) -> usize {
     if placed == CANDY_COUNT {
         return connectivity_numerator(board);
     }
-    if let Some(&value) = cache.get(&(*board, placed)) {
+    if let Some(&value) = cache.get(board) {
         return value;
     }
     let empty_count = CANDY_COUNT - placed;
@@ -486,7 +507,9 @@ fn exact_future_sum(
                 .unwrap();
         }
     }
-    cache.insert((*board, placed), sum);
+    // The number of non-empty cells uniquely determines `placed`, so the board
+    // itself is sufficient as a cache key.
+    cache.insert(*board, sum);
     sum
 }
 
@@ -505,6 +528,7 @@ fn run() -> Result<(), String> {
     let input = Input::new(flavors);
     let rule_actions = build_rule_actions(&input);
     let mut state = State::new();
+    let mut exact_cache = ExactCache::default();
     let stdout = io::stdout();
     let mut output = io::BufWriter::new(stdout.lock());
 
@@ -518,6 +542,7 @@ fn run() -> Result<(), String> {
             &rule_actions,
             &settings,
             started,
+            &mut exact_cache,
         )?;
         state.apply_action(action);
         writeln!(output, "{}", action_char(action))
@@ -563,7 +588,8 @@ mod tests {
                 &input,
                 &rule_actions,
                 &settings,
-                Instant::now()
+                Instant::now(),
+                &mut ExactCache::default(),
             )
             .unwrap(),
             FRONT
@@ -575,7 +601,7 @@ mod tests {
         let input = Input::new([1; CANDY_COUNT]);
         let mut board = [1; CANDY_COUNT];
         board[..4].fill(0);
-        let mut cache = HashMap::new();
+        let mut cache = ExactCache::default();
         assert_eq!(
             exact_future_sum(&board, 96, &input, &mut cache),
             24 * 10_000
