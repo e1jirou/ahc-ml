@@ -35,7 +35,8 @@ PYTHONPATH=python .venv/bin/python -m examples.ahc015.python.evaluate \
 提出器は最良の actor を int8 量子化して Rust に埋め込む。終盤は88〜92手目にモンテカルロ探索、
 93手目以降に7手の厳密 expectimax を使う。詳細と検証結果は `docs/solution.md` を参照する。
 playoutでは未来rank列・24ルールの行動列・共通の初回配置を再利用し、終端連結度を`u128` bitboardで
-計算する。architecture非依存の高速化で探索結果を変えず、512 sample時の時間を約15%短縮した。
+計算する。直後2配置のrank組を層化し、最後に盤面へ影響する方向は4方向から厳密に選ぶ。各ルール96 sample
+を使う。
 
 ```bash
 PYTHONPATH=python .venv/bin/python -m examples.ahc015.python.export \

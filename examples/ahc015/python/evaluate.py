@@ -48,9 +48,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rust-mc-turns", type=int, default=12)
     parser.add_argument("--rust-mc-actions", type=int, default=4)
-    parser.add_argument("--rust-mc-samples", type=int, default=128)
+    parser.add_argument("--rust-mc-samples", type=int, default=96)
     parser.add_argument("--rust-mc-min-gain", type=float, default=20.0)
     parser.add_argument("--rust-mc-strategy", choices=("equal", "halving"), default="equal")
+    parser.add_argument("--rust-mc-stratified-turns", type=int, default=2)
+    parser.add_argument(
+        "--rust-mc-exact-last-action",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--rust-time-limit-ms", type=int, default=1900)
     parser.add_argument("--rust-time-reserve-ms", type=int, default=200)
     return parser.parse_args()
@@ -75,6 +81,8 @@ def evaluate_rust_case(
     mc_samples: int,
     mc_min_gain: float,
     mc_strategy: str,
+    mc_stratified_turns: int,
+    mc_exact_last_action: bool,
     time_limit_ms: int,
     time_reserve_ms: int,
 ) -> int:
@@ -89,6 +97,8 @@ def evaluate_rust_case(
     command.extend(("--mc-samples", str(mc_samples)))
     command.extend(("--mc-min-gain", str(mc_min_gain)))
     command.extend(("--mc-strategy", mc_strategy))
+    command.extend(("--mc-stratified-turns", str(mc_stratified_turns)))
+    command.extend(("--mc-exact-last-action", str(int(mc_exact_last_action))))
     command.extend(("--time-limit-ms", str(time_limit_ms)))
     command.extend(("--time-reserve-ms", str(time_reserve_ms)))
     completed = subprocess.run(
@@ -119,9 +129,11 @@ def evaluate_rust_policy(
     exact_turns: int,
     mc_turns: int = 12,
     mc_actions: int = 4,
-    mc_samples: int = 128,
+    mc_samples: int = 96,
     mc_min_gain: float = 20.0,
     mc_strategy: str = "equal",
+    mc_stratified_turns: int = 2,
+    mc_exact_last_action: bool = True,
     time_limit_ms: int = 1900,
     time_reserve_ms: int = 200,
 ) -> np.ndarray:
@@ -146,6 +158,8 @@ def evaluate_rust_policy(
                 mc_samples,
                 mc_min_gain,
                 mc_strategy,
+                mc_stratified_turns,
+                mc_exact_last_action,
                 time_limit_ms,
                 time_reserve_ms,
             ),
@@ -170,6 +184,8 @@ def main() -> None:
         raise ValueError("--rust-mc-samples must be nonnegative")
     if args.rust_mc_min_gain < 0:
         raise ValueError("--rust-mc-min-gain must be nonnegative")
+    if not 0 <= args.rust_mc_stratified_turns <= 3:
+        raise ValueError("--rust-mc-stratified-turns must be in [0, 3]")
     if not 0 <= args.rust_time_reserve_ms < args.rust_time_limit_ms:
         raise ValueError("Rust time reserve must be nonnegative and smaller than the limit")
     device, _ = select_device(args.device)
@@ -254,6 +270,8 @@ def main() -> None:
             args.rust_mc_samples,
             args.rust_mc_min_gain,
             args.rust_mc_strategy,
+            args.rust_mc_stratified_turns,
+            args.rust_mc_exact_last_action,
             args.rust_time_limit_ms,
             args.rust_time_reserve_ms,
         )

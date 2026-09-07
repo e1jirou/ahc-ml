@@ -57,6 +57,8 @@ struct SearchSettings {
     mc_samples: u64,
     mc_min_gain: f64,
     mc_strategy: McStrategy,
+    mc_stratified_turns: usize,
+    mc_exact_last_action: bool,
     time_limit: Duration,
     time_reserve: Duration,
 }
@@ -102,9 +104,11 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
     let mut exact_turns = DEFAULT_EXACT_TURNS;
     let mut mc_turns = 12;
     let mut mc_actions = 4;
-    let mut mc_samples = 128;
+    let mut mc_samples = 96;
     let mut mc_min_gain = 20.0;
     let mut mc_strategy = McStrategy::Equal;
+    let mut mc_stratified_turns = 2;
+    let mut mc_exact_last_action = true;
     let mut time_limit_ms = 1900;
     let mut time_reserve_ms = 200;
     while let Some(argument) = arguments.next() {
@@ -154,6 +158,19 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
                     _ => return Err("--mc-strategy must be equal or halving".to_string()),
                 };
             }
+            "--mc-stratified-turns" => {
+                mc_stratified_turns = parse_next(&mut arguments, "--mc-stratified-turns")?;
+                if mc_stratified_turns > 3 {
+                    return Err("--mc-stratified-turns must be in 0..=3".to_string());
+                }
+            }
+            "--mc-exact-last-action" => {
+                mc_exact_last_action = match arguments.next().as_deref() {
+                    Some("0") => false,
+                    Some("1") => true,
+                    _ => return Err("--mc-exact-last-action must be 0 or 1".to_string()),
+                };
+            }
             "--time-limit-ms" => {
                 time_limit_ms = parse_next(&mut arguments, "--time-limit-ms")?;
             }
@@ -183,6 +200,8 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
             mc_samples,
             mc_min_gain,
             mc_strategy,
+            mc_stratified_turns,
+            mc_exact_last_action,
             time_limit: Duration::from_millis(time_limit_ms),
             time_reserve: Duration::from_millis(time_reserve_ms),
         },
@@ -311,13 +330,7 @@ fn monte_carlo_action(
     let mut sample = 0u64;
     let mut next_halving = 4u32;
     loop {
-        let seed = splitmix64(0x9e37_79b9_7f4a_7c15 ^ (placed as u64) << 32 ^ sample);
-        let mut random = seed;
-        let mut ranks = [0u8; CANDY_COUNT];
-        for position in placed..CANDY_COUNT {
-            random = splitmix64(random);
-            ranks[position] = (random as usize % (CANDY_COUNT - position) + 1) as u8;
-        }
+        let ranks = playout_ranks(placed, sample, settings.mc_stratified_turns);
         let first_boards: [Board; ACTION_COUNT] = std::array::from_fn(|action| {
             place_on_board_at_rank(
                 &candidates[action],
@@ -332,6 +345,7 @@ fn monte_carlo_action(
                 input,
                 &rule_actions[arm.rule],
                 &ranks,
+                settings.mc_exact_last_action,
             ) as u64;
             arm.samples += 1;
         }
@@ -424,22 +438,79 @@ fn rule_playout(
     input: &Input,
     actions: &[u8; CANDY_COUNT],
     ranks: &[u8; CANDY_COUNT],
+    exact_last_action: bool,
 ) -> usize {
     let mut result = *board_after_first_placement;
     if placed + 1 == CANDY_COUNT {
         return connectivity_numerator(&result);
+    }
+    if exact_last_action && placed + 2 == CANDY_COUNT {
+        return optimal_last_action_score(&result, input.flavors()[placed + 1]);
     }
     result = tilt(&result, actions[placed] as usize);
     for position in placed + 1..CANDY_COUNT {
         let empty_count = CANDY_COUNT - position;
         result =
             place_on_board_at_rank(&result, ranks[position] as usize, input.flavors()[position]);
+        if exact_last_action && empty_count == 2 {
+            return optimal_last_action_score(&result, input.flavors()[position + 1]);
+        }
         if empty_count == 1 {
             break;
         }
         result = tilt(&result, actions[position] as usize);
     }
     connectivity_numerator(&result)
+}
+
+fn optimal_last_action_score(board: &Board, final_flavor: u8) -> usize {
+    (0..ACTION_COUNT)
+        .map(|action| {
+            let tilted = tilt(board, action);
+            let terminal = place_on_board_at_rank(&tilted, 1, final_flavor);
+            connectivity_numerator(&terminal)
+        })
+        .max()
+        .unwrap()
+}
+
+fn playout_ranks(placed: usize, sample: u64, stratified_turns: usize) -> [u8; CANDY_COUNT] {
+    let seed = splitmix64(0x9e37_79b9_7f4a_7c15 ^ (placed as u64) << 32 ^ sample);
+    let mut random = seed;
+    let depth = stratified_turns.min(CANDY_COUNT - placed);
+    let combination_count = (0..depth)
+        .map(|offset| (CANDY_COUNT - placed - offset) as u64)
+        .product::<u64>();
+    let mut combination = if depth == 0 {
+        0
+    } else {
+        let scramble = splitmix64(0xd1b5_4a32_d192_ed03 ^ (placed as u64) << 32);
+        let mut step = splitmix64(scramble) % combination_count;
+        while greatest_common_divisor(step, combination_count) != 1 {
+            step = (step + 1) % combination_count;
+        }
+        (scramble % combination_count + sample % combination_count * step) % combination_count
+    };
+    let mut ranks = [0; CANDY_COUNT];
+    for position in placed..CANDY_COUNT {
+        random = splitmix64(random);
+        let empty_count = CANDY_COUNT - position;
+        ranks[position] = if position - placed < depth {
+            let rank = combination % empty_count as u64;
+            combination /= empty_count as u64;
+            (rank + 1) as u8
+        } else {
+            (random as usize % empty_count + 1) as u8
+        };
+    }
+    ranks
+}
+
+fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
 }
 
 fn rule_action(current: usize, immediate_next: usize, later_different: Option<usize>) -> usize {
@@ -578,6 +649,8 @@ mod tests {
             mc_samples: 0,
             mc_min_gain: 0.0,
             mc_strategy: McStrategy::Equal,
+            mc_stratified_turns: 0,
+            mc_exact_last_action: false,
             time_limit: Duration::from_secs(2),
             time_reserve: Duration::from_millis(100),
         };
@@ -606,6 +679,42 @@ mod tests {
             exact_future_sum(&board, 96, &input, &mut cache),
             24 * 10_000
         );
+    }
+
+    #[test]
+    fn stratified_pairs_do_not_repeat_before_exhaustion() {
+        let mut seen = [[false; 11]; 12];
+        for sample in 0..132 {
+            let ranks = playout_ranks(88, sample, 2);
+            let first = ranks[88] as usize - 1;
+            let second = ranks[89] as usize - 1;
+            assert!(!seen[first][second]);
+            seen[first][second] = true;
+        }
+    }
+
+    #[test]
+    fn one_turn_stratification_is_balanced() {
+        let mut counts = [0; 8];
+        for sample in 0..128 {
+            counts[playout_ranks(92, sample, 1)[92] as usize - 1] += 1;
+        }
+        assert_eq!(counts, [16; 8]);
+    }
+
+    #[test]
+    fn playout_optimizes_the_last_nontrivial_action() {
+        let input = Input::new(std::array::from_fn(|index| (index % 3 + 1) as u8));
+        let mut board = std::array::from_fn(|index| (index % 3 + 1) as u8);
+        board[44] = 0;
+        let actions = [FRONT as u8; CANDY_COUNT];
+        let ranks = [1; CANDY_COUNT];
+        let score = rule_playout(&board, 98, &input, &actions, &ranks, true);
+        assert_eq!(
+            score,
+            optimal_last_action_score(&board, input.flavors()[99])
+        );
+        assert!(score >= rule_playout(&board, 98, &input, &actions, &ranks, false));
     }
 
     #[test]
