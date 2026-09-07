@@ -178,6 +178,7 @@ fn choose_action(
     model: Option<&Ahc015ValueNet>,
     state: &State,
     input: &Input,
+    rule_actions: &[[u8; CANDY_COUNT]; 24],
     settings: &SearchSettings,
     started: Instant,
 ) -> Result<usize, String> {
@@ -218,6 +219,7 @@ fn choose_action(
                 &residuals,
                 state.placed(),
                 input,
+                rule_actions,
                 settings,
                 now + turn_budget,
             ));
@@ -248,6 +250,7 @@ fn monte_carlo_action(
     model_values: &[f32],
     placed: usize,
     input: &Input,
+    rule_actions: &[[u8; CANDY_COUNT]; 24],
     settings: &SearchSettings,
     deadline: Instant,
 ) -> usize {
@@ -259,10 +262,19 @@ fn monte_carlo_action(
     });
     actions.truncate(settings.mc_actions);
     let model_action = actions[0];
+    let mut rules: Vec<usize> = Vec::with_capacity(24);
+    for rule in 0..24 {
+        if !rules
+            .iter()
+            .any(|&existing| rule_actions[existing][placed..] == rule_actions[rule][placed..])
+        {
+            rules.push(rule);
+        }
+    }
     let mut arms = actions
         .into_iter()
         .flat_map(|action| {
-            (0..24).map(move |rule| McArm {
+            rules.iter().copied().map(move |rule| McArm {
                 action,
                 rule,
                 sum: 0,
@@ -274,8 +286,27 @@ fn monte_carlo_action(
     let mut next_halving = 4u32;
     loop {
         let seed = splitmix64(0x9e37_79b9_7f4a_7c15 ^ (placed as u64) << 32 ^ sample);
+        let mut random = seed;
+        let mut ranks = [0u8; CANDY_COUNT];
+        for position in placed..CANDY_COUNT {
+            random = splitmix64(random);
+            ranks[position] = (random as usize % (CANDY_COUNT - position) + 1) as u8;
+        }
+        let first_boards: [Board; ACTION_COUNT] = std::array::from_fn(|action| {
+            place_on_board_at_rank(
+                &candidates[action],
+                ranks[placed] as usize,
+                input.flavors()[placed],
+            )
+        });
         for arm in &mut arms {
-            arm.sum += rule_playout(&candidates[arm.action], placed, input, arm.rule, seed) as u64;
+            arm.sum += rule_playout(
+                &first_boards[arm.action],
+                placed,
+                input,
+                &rule_actions[arm.rule],
+                &ranks,
+            ) as u64;
             arm.samples += 1;
         }
         sample += 1;
@@ -327,7 +358,7 @@ fn compare_mc_arms(left: &McArm, right: &McArm) -> std::cmp::Ordering {
         .then_with(|| left.rule.cmp(&right.rule))
 }
 
-fn rule_playout(board: &Board, placed: usize, input: &Input, rule: usize, seed: u64) -> usize {
+fn build_rule_actions(input: &Input) -> [[u8; CANDY_COUNT]; 24] {
     const PERMUTATIONS: [[u8; 3]; 6] = [
         [1, 2, 3],
         [1, 3, 2],
@@ -336,30 +367,51 @@ fn rule_playout(board: &Board, placed: usize, input: &Input, rule: usize, seed: 
         [3, 1, 2],
         [3, 2, 1],
     ];
-    let rotation = rule / 6;
-    let targets = PERMUTATIONS[rule % 6];
-    let mut abstract_flavor = [0usize; 4];
-    for (abstract_id, &flavor) in targets.iter().enumerate() {
-        abstract_flavor[flavor as usize] = abstract_id;
+    std::array::from_fn(|rule| {
+        let rotation = rule / 6;
+        let targets = PERMUTATIONS[rule % 6];
+        let mut abstract_flavor = [0usize; 4];
+        for (abstract_id, &flavor) in targets.iter().enumerate() {
+            abstract_flavor[flavor as usize] = abstract_id;
+        }
+        std::array::from_fn(|position| {
+            if position + 1 == CANDY_COUNT {
+                return FRONT as u8;
+            }
+            let current = abstract_flavor[input.flavors()[position] as usize];
+            let immediate_next = abstract_flavor[input.flavors()[position + 1] as usize];
+            let later_different = input.flavors()[position + 1..]
+                .iter()
+                .map(|&flavor| abstract_flavor[flavor as usize])
+                .find(|&flavor| flavor != current);
+            rotate_action(
+                rule_action(current, immediate_next, later_different),
+                rotation,
+            ) as u8
+        })
+    })
+}
+
+fn rule_playout(
+    board_after_first_placement: &Board,
+    placed: usize,
+    input: &Input,
+    actions: &[u8; CANDY_COUNT],
+    ranks: &[u8; CANDY_COUNT],
+) -> usize {
+    let mut result = *board_after_first_placement;
+    if placed + 1 == CANDY_COUNT {
+        return connectivity_numerator(&result);
     }
-    let mut result = *board;
-    let mut random = seed;
-    for position in placed..CANDY_COUNT {
-        random = splitmix64(random);
+    result = tilt(&result, actions[placed] as usize);
+    for position in placed + 1..CANDY_COUNT {
         let empty_count = CANDY_COUNT - position;
-        let rank = random as usize % empty_count + 1;
-        result = place_on_board_at_rank(&result, rank, input.flavors()[position]);
+        result =
+            place_on_board_at_rank(&result, ranks[position] as usize, input.flavors()[position]);
         if empty_count == 1 {
             break;
         }
-        let current = abstract_flavor[input.flavors()[position] as usize];
-        let immediate_next = abstract_flavor[input.flavors()[position + 1] as usize];
-        let later_different = input.flavors()[position + 1..]
-            .iter()
-            .map(|&flavor| abstract_flavor[flavor as usize])
-            .find(|&flavor| flavor != current);
-        let base_action = rule_action(current, immediate_next, later_different);
-        result = tilt(&result, rotate_action(base_action, rotation));
+        result = tilt(&result, actions[position] as usize);
     }
     connectivity_numerator(&result)
 }
@@ -451,6 +503,7 @@ fn run() -> Result<(), String> {
         }
     }
     let input = Input::new(flavors);
+    let rule_actions = build_rule_actions(&input);
     let mut state = State::new();
     let stdout = io::stdout();
     let mut output = io::BufWriter::new(stdout.lock());
@@ -458,7 +511,14 @@ fn run() -> Result<(), String> {
     for turn in 0..CANDY_COUNT {
         let rank: usize = reader.read()?;
         state.place_at_rank(rank, input.flavors()[turn]);
-        let action = choose_action(model.as_ref(), &state, &input, &settings, started)?;
+        let action = choose_action(
+            model.as_ref(),
+            &state,
+            &input,
+            &rule_actions,
+            &settings,
+            started,
+        )?;
         state.apply_action(action);
         writeln!(output, "{}", action_char(action))
             .map_err(|error| format!("failed to write action: {error}"))?;
@@ -485,6 +545,7 @@ mod tests {
         let input = Input::new(std::array::from_fn(|index| (index % 3 + 1) as u8));
         let mut state = State::new();
         state.place_at_rank(1, 1);
+        let rule_actions = build_rule_actions(&input);
         let settings = SearchSettings {
             exact_turns: 0,
             mc_turns: 0,
@@ -496,7 +557,15 @@ mod tests {
             time_reserve: Duration::from_millis(100),
         };
         assert_eq!(
-            choose_action(None, &state, &input, &settings, Instant::now()).unwrap(),
+            choose_action(
+                None,
+                &state,
+                &input,
+                &rule_actions,
+                &settings,
+                Instant::now()
+            )
+            .unwrap(),
             FRONT
         );
     }

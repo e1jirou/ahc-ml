@@ -188,6 +188,9 @@ afterstate版は16,656.832点高く、固定512ケースのbestでもpre-tilt版
   連結度分子で20以上の推定改善を要求する。
 - 固定sample上限に加え、残時間を残りのモンテカルロ手数で割ったdeadlineで打ち切る。`--mc-turns 0` と
   `--exact-turns 0`でそれぞれ無効化できる。
+- future rank列とルールの行動列を事前計算し、共通の初回配置と同一suffixルールを再利用する。終端連結度は
+  3味の`u128` bitboard flood fillで求める。architecture非依存の高速化で512 sample時は約15%短縮したが、
+  128から512 sampleへ増やしても未使用1,000ケースの平均は525点低下したため、sample上限は増やさない。
 
 ## 実装上の確認事項
 

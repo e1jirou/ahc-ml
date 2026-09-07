@@ -180,46 +180,34 @@ pub fn place_on_board_at_rank(board: &Board, rank: usize, flavor: u8) -> Board {
 }
 
 pub fn connectivity_numerator(board: &Board) -> usize {
-    let mut visited = [false; CANDY_COUNT];
-    let mut stack = [0usize; CANDY_COUNT];
+    const COLUMN_ZERO: u128 =
+        1 | 1 << 10 | 1 << 20 | 1 << 30 | 1 << 40 | 1 << 50 | 1 << 60 | 1 << 70 | 1 << 80 | 1 << 90;
+    const COLUMN_NINE: u128 = COLUMN_ZERO << 9;
+    let mut flavors = [0u128; 3];
+    for (index, &flavor) in board.iter().enumerate() {
+        if flavor != 0 {
+            flavors[flavor as usize - 1] |= 1u128 << index;
+        }
+    }
     let mut numerator = 0;
-    for start in 0..CANDY_COUNT {
-        let flavor = board[start];
-        if flavor == 0 || visited[start] {
-            continue;
-        }
-        let mut stack_size = 1;
-        stack[0] = start;
-        visited[start] = true;
-        let mut component_size = 0;
-        while stack_size > 0 {
-            stack_size -= 1;
-            let current = stack[stack_size];
-            component_size += 1;
-            let row = current / SIDE;
-            let column = current % SIDE;
-            let mut neighbors = [usize::MAX; 4];
-            if row > 0 {
-                neighbors[0] = cell(row - 1, column);
-            }
-            if row + 1 < SIDE {
-                neighbors[1] = cell(row + 1, column);
-            }
-            if column > 0 {
-                neighbors[2] = cell(row, column - 1);
-            }
-            if column + 1 < SIDE {
-                neighbors[3] = cell(row, column + 1);
-            }
-            for next in neighbors {
-                if next != usize::MAX && !visited[next] && board[next] == flavor {
-                    visited[next] = true;
-                    stack[stack_size] = next;
-                    stack_size += 1;
+    for mut remaining in flavors {
+        while remaining != 0 {
+            let mut component = remaining & remaining.wrapping_neg();
+            loop {
+                let neighbors = (component << SIDE)
+                    | (component >> SIDE)
+                    | ((component & !COLUMN_NINE) << 1)
+                    | ((component & !COLUMN_ZERO) >> 1);
+                let expanded = component | (neighbors & remaining);
+                if expanded == component {
+                    break;
                 }
+                component = expanded;
             }
+            let size = component.count_ones() as usize;
+            numerator += size * size;
+            remaining &= !component;
         }
-        numerator += component_size * component_size;
     }
     numerator
 }
@@ -227,6 +215,40 @@ pub fn connectivity_numerator(board: &Board) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connectivity_numerator_reference(board: &Board) -> usize {
+        let mut visited = [false; CANDY_COUNT];
+        let mut numerator = 0;
+        for start in 0..CANDY_COUNT {
+            if board[start] == 0 || visited[start] {
+                continue;
+            }
+            let mut stack = vec![start];
+            visited[start] = true;
+            let mut size = 0;
+            while let Some(current) = stack.pop() {
+                size += 1;
+                let row = current / SIDE;
+                let column = current % SIDE;
+                for (next_row, next_column) in [
+                    (row.wrapping_sub(1), column),
+                    (row + 1, column),
+                    (row, column.wrapping_sub(1)),
+                    (row, column + 1),
+                ] {
+                    if next_row < SIDE && next_column < SIDE {
+                        let next = cell(next_row, next_column);
+                        if !visited[next] && board[next] == board[current] {
+                            visited[next] = true;
+                            stack.push(next);
+                        }
+                    }
+                }
+            }
+            numerator += size * size;
+        }
+        numerator
+    }
 
     #[test]
     fn tilt_preserves_order_and_compacts() {
@@ -262,5 +284,20 @@ mod tests {
         board[cell(4, 4)] = 2;
         board[cell(5, 4)] = 2;
         assert_eq!(connectivity_numerator(&board), 4 + 1 + 4);
+    }
+
+    #[test]
+    fn bitboard_component_score_matches_reference() {
+        let mut random = 1u64;
+        for _ in 0..1_000 {
+            let board = std::array::from_fn(|_| {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (random >> 32) as u8 % 4
+            });
+            assert_eq!(
+                connectivity_numerator(&board),
+                connectivity_numerator_reference(&board)
+            );
+        }
     }
 }
