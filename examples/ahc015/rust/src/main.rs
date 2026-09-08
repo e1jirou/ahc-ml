@@ -1,5 +1,6 @@
 mod features;
 mod game;
+mod generated_mcts_prior;
 mod generated_model;
 
 use std::collections::{HashMap, VecDeque};
@@ -60,6 +61,7 @@ enum EndgameSearch {
 enum MctsPrior {
     Uniform,
     Connectivity,
+    TinyNn,
 }
 
 struct SearchSettings {
@@ -75,6 +77,13 @@ struct SearchSettings {
     mcts_simulations: u64,
     mcts_exploration: f64,
     mcts_prior: MctsPrior,
+    mcts_early_prior: MctsPrior,
+    mcts_rollout_depth: usize,
+    mcts_rollout_cutoff_until: usize,
+    mcts_tail_repair_turns: usize,
+    mcts_tail_repair_passes: usize,
+    mcts_early_simulations: u64,
+    mcts_early_min_gain: f64,
     time_limit: Duration,
     time_reserve: Duration,
 }
@@ -129,8 +138,15 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
     let mut mcts_simulations = 2560;
     let mut mcts_exploration = 700.0;
     let mut mcts_prior = MctsPrior::Connectivity;
-    let mut time_limit_ms = 1800;
-    let mut time_reserve_ms = 200;
+    let mut mcts_early_prior = MctsPrior::Connectivity;
+    let mut mcts_rollout_depth = 0;
+    let mut mcts_rollout_cutoff_until = CANDY_COUNT;
+    let mut mcts_tail_repair_turns = 2;
+    let mut mcts_tail_repair_passes = 1;
+    let mut mcts_early_simulations = 0;
+    let mut mcts_early_min_gain = 20.0;
+    let mut time_limit_ms = 1400;
+    let mut time_reserve_ms = 300;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--model" => {
@@ -211,8 +227,60 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
                 mcts_prior = match arguments.next().as_deref() {
                     Some("uniform") => MctsPrior::Uniform,
                     Some("connectivity") => MctsPrior::Connectivity,
-                    _ => return Err("--mcts-prior must be uniform or connectivity".to_string()),
+                    Some("tiny-nn") => MctsPrior::TinyNn,
+                    _ => {
+                        return Err(
+                            "--mcts-prior must be uniform, connectivity, or tiny-nn".to_string()
+                        );
+                    }
                 };
+            }
+            "--mcts-early-prior" => {
+                mcts_early_prior = match arguments.next().as_deref() {
+                    Some("uniform") => MctsPrior::Uniform,
+                    Some("connectivity") => MctsPrior::Connectivity,
+                    Some("tiny-nn") => MctsPrior::TinyNn,
+                    _ => {
+                        return Err(
+                            "--mcts-early-prior must be uniform, connectivity, or tiny-nn"
+                                .to_string(),
+                        );
+                    }
+                };
+            }
+            "--mcts-rollout-depth" => {
+                mcts_rollout_depth = parse_next(&mut arguments, "--mcts-rollout-depth")?;
+                if mcts_rollout_depth > CANDY_COUNT {
+                    return Err("--mcts-rollout-depth must be at most 100".to_string());
+                }
+            }
+            "--mcts-rollout-cutoff-until" => {
+                mcts_rollout_cutoff_until =
+                    parse_next(&mut arguments, "--mcts-rollout-cutoff-until")?;
+                if mcts_rollout_cutoff_until > CANDY_COUNT {
+                    return Err("--mcts-rollout-cutoff-until must be at most 100".to_string());
+                }
+            }
+            "--mcts-tail-repair-turns" => {
+                mcts_tail_repair_turns = parse_next(&mut arguments, "--mcts-tail-repair-turns")?;
+                if mcts_tail_repair_turns > CANDY_COUNT {
+                    return Err("--mcts-tail-repair-turns must be at most 100".to_string());
+                }
+            }
+            "--mcts-tail-repair-passes" => {
+                mcts_tail_repair_passes = parse_next(&mut arguments, "--mcts-tail-repair-passes")?;
+                if !(1..=10).contains(&mcts_tail_repair_passes) {
+                    return Err("--mcts-tail-repair-passes must be in 1..=10".to_string());
+                }
+            }
+            "--mcts-early-simulations" => {
+                mcts_early_simulations = parse_next(&mut arguments, "--mcts-early-simulations")?;
+            }
+            "--mcts-early-min-gain" => {
+                mcts_early_min_gain = parse_next(&mut arguments, "--mcts-early-min-gain")?;
+                if mcts_early_min_gain < 0.0 {
+                    return Err("--mcts-early-min-gain must be nonnegative".to_string());
+                }
             }
             "--time-limit-ms" => {
                 time_limit_ms = parse_next(&mut arguments, "--time-limit-ms")?;
@@ -249,6 +317,13 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
             mcts_simulations,
             mcts_exploration,
             mcts_prior,
+            mcts_early_prior,
+            mcts_rollout_depth,
+            mcts_rollout_cutoff_until,
+            mcts_tail_repair_turns,
+            mcts_tail_repair_passes,
+            mcts_early_simulations,
+            mcts_early_min_gain,
             time_limit: Duration::from_millis(time_limit_ms),
             time_reserve: Duration::from_millis(time_reserve_ms),
         },
@@ -360,6 +435,27 @@ fn mcts_action(
     settings: &SearchSettings,
     deadline: Instant,
 ) -> usize {
+    let rollout_depth = if placed < settings.mcts_rollout_cutoff_until {
+        settings.mcts_rollout_depth
+    } else {
+        0
+    };
+    let simulation_limit =
+        if placed < settings.mcts_rollout_cutoff_until && settings.mcts_early_simulations > 0 {
+            settings.mcts_early_simulations
+        } else {
+            settings.mcts_simulations
+        };
+    let min_gain = if placed < settings.mcts_rollout_cutoff_until {
+        settings.mcts_early_min_gain
+    } else {
+        settings.mc_min_gain
+    };
+    let prior = if placed < settings.mcts_rollout_cutoff_until {
+        settings.mcts_early_prior
+    } else {
+        settings.mcts_prior
+    };
     let model_action = (0..ACTION_COUNT)
         .max_by(|&left, &right| {
             model_values[left]
@@ -391,8 +487,14 @@ fn mcts_action(
                 &rule_actions[rule],
                 &ranks,
                 settings.mcts_exploration,
-                settings.mcts_prior,
-                settings.mc_exact_last_action,
+                prior,
+                rollout_depth,
+                if settings.mc_exact_last_action {
+                    settings.mcts_tail_repair_turns
+                } else {
+                    0
+                },
+                settings.mcts_tail_repair_passes,
                 &mut table,
             );
             sums[root] += score as u64;
@@ -402,7 +504,7 @@ fn mcts_action(
             }
         }
         simulation += 1;
-        if settings.mcts_simulations > 0 && simulation >= settings.mcts_simulations {
+        if simulation_limit > 0 && simulation >= simulation_limit {
             break;
         }
     }
@@ -423,7 +525,7 @@ fn mcts_action(
     }
     let best_mean = sums[best_action] as f64 / visits[best_action] as f64;
     let model_mean = sums[model_action] as f64 / visits[model_action] as f64;
-    if best_mean >= model_mean + settings.mc_min_gain {
+    if best_mean >= model_mean + min_gain {
         best_action
     } else {
         model_action
@@ -439,7 +541,9 @@ fn mcts_simulation(
     ranks: &[u8; CANDY_COUNT],
     exploration: f64,
     prior: MctsPrior,
-    exact_last_action: bool,
+    rollout_depth: usize,
+    tail_repair_turns: usize,
+    tail_repair_passes: usize,
     table: &mut MctsTable,
 ) -> usize {
     let mut board = *root;
@@ -454,7 +558,7 @@ fn mcts_simulation(
 
         let is_new = !table.contains_key(&board);
         if is_new {
-            table.insert(board, new_mcts_node(&board, prior));
+            table.insert(board, new_mcts_node(&board, prior, input, position + 1));
         }
         let action = select_mcts_action(table.get(&board).unwrap(), exploration);
         let edge_unvisited = table.get(&board).unwrap().action_visits[action] == 0;
@@ -467,7 +571,9 @@ fn mcts_simulation(
                 input,
                 rollout_actions,
                 ranks,
-                exact_last_action,
+                rollout_depth,
+                tail_repair_turns,
+                tail_repair_passes,
             );
             mcts_backpropagate(table, &path[..=depth], score);
             return score;
@@ -476,7 +582,7 @@ fn mcts_simulation(
     unreachable!()
 }
 
-fn new_mcts_node(board: &Board, prior: MctsPrior) -> MctsNode {
+fn new_mcts_node(board: &Board, prior: MctsPrior, input: &Input, placed: usize) -> MctsNode {
     if prior == MctsPrior::Uniform {
         return MctsNode {
             visits: 0,
@@ -486,7 +592,18 @@ fn new_mcts_node(board: &Board, prior: MctsPrior) -> MctsNode {
         };
     }
     let mut actions = [FRONT, BACK, LEFT, RIGHT];
-    actions.sort_by_key(|&action| std::cmp::Reverse(connectivity_numerator(&tilt(board, action))));
+    if prior == MctsPrior::Connectivity {
+        actions
+            .sort_by_key(|&action| std::cmp::Reverse(connectivity_numerator(&tilt(board, action))));
+    } else {
+        let scores: [f32; ACTION_COUNT] =
+            std::array::from_fn(|action| tiny_prior_score(&tilt(board, action), input, placed));
+        actions.sort_by(|&left, &right| {
+            scores[right]
+                .total_cmp(&scores[left])
+                .then_with(|| left.cmp(&right))
+        });
+    }
     let mut priorities = [0; ACTION_COUNT];
     for (rank, action) in actions.into_iter().enumerate() {
         priorities[action] = (ACTION_COUNT - rank) as u8;
@@ -497,6 +614,105 @@ fn new_mcts_node(board: &Board, prior: MctsPrior) -> MctsNode {
         action_sums: [0; ACTION_COUNT],
         priorities,
     }
+}
+
+fn tiny_prior_score(board: &Board, input: &Input, placed: usize) -> f32 {
+    const FEATURE_COUNT: usize = 16;
+    const HIDDEN: usize = 16;
+    let mapping = crate::features::dynamic_flavor_mapping(input, placed);
+    let mut features = [0.0f32; FEATURE_COUNT];
+    let mut same_edges = 0usize;
+    for canonical in 1..=3 {
+        let mut visited = [false; CANDY_COUNT];
+        let mut component_square = 0usize;
+        let mut largest = 0usize;
+        let mut components = 0usize;
+        let mut empty_contacts = 0usize;
+        let mut exposure_edges = 0usize;
+        for start in 0..CANDY_COUNT {
+            if visited[start] || mapping[board[start] as usize] as usize != canonical {
+                continue;
+            }
+            components += 1;
+            visited[start] = true;
+            let mut stack = [0usize; CANDY_COUNT];
+            stack[0] = start;
+            let mut stack_len = 1;
+            let mut size = 0usize;
+            while stack_len > 0 {
+                stack_len -= 1;
+                let cell = stack[stack_len];
+                size += 1;
+                let row = cell / 10;
+                let column = cell % 10;
+                for neighbor in [
+                    row.checked_sub(1).map(|next| next * 10 + column),
+                    (row + 1 < 10).then_some((row + 1) * 10 + column),
+                    column.checked_sub(1).map(|next| row * 10 + next),
+                    (column + 1 < 10).then_some(row * 10 + column + 1),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !visited[neighbor] && mapping[board[neighbor] as usize] as usize == canonical
+                    {
+                        visited[neighbor] = true;
+                        stack[stack_len] = neighbor;
+                        stack_len += 1;
+                    }
+                }
+            }
+            component_square += size * size;
+            largest = largest.max(size);
+        }
+        for cell in 0..CANDY_COUNT {
+            if mapping[board[cell] as usize] as usize != canonical {
+                continue;
+            }
+            let row = cell / 10;
+            let column = cell % 10;
+            for neighbor in [
+                row.checked_sub(1).map(|next| next * 10 + column),
+                (row + 1 < 10).then_some((row + 1) * 10 + column),
+                column.checked_sub(1).map(|next| row * 10 + next),
+                (column + 1 < 10).then_some(row * 10 + column + 1),
+            ] {
+                if let Some(neighbor) = neighbor {
+                    let neighbor_flavor = mapping[board[neighbor] as usize] as usize;
+                    if neighbor_flavor == 0 {
+                        empty_contacts += 1;
+                        exposure_edges += 1;
+                    } else if neighbor_flavor == canonical {
+                        same_edges += 1;
+                    }
+                } else {
+                    exposure_edges += 1;
+                }
+            }
+        }
+        let base = (canonical - 1) * 5;
+        features[base] = component_square as f32 / 10_000.0;
+        features[base + 1] = largest as f32 / 100.0;
+        features[base + 2] = components as f32 / 100.0;
+        features[base + 3] = empty_contacts as f32 / 180.0;
+        features[base + 4] = exposure_edges as f32 / 220.0;
+    }
+    features[15] = same_edges as f32 / 360.0;
+    let mut hidden = [0.0f32; HIDDEN];
+    for (output, value) in hidden.iter_mut().enumerate() {
+        *value = generated_mcts_prior::HIDDEN_BIAS[output];
+        for (input_index, &feature) in features.iter().enumerate() {
+            *value +=
+                generated_mcts_prior::HIDDEN_WEIGHT[output * FEATURE_COUNT + input_index] * feature;
+        }
+        *value = value.max(0.0);
+    }
+    generated_mcts_prior::OUTPUT_BIAS[0]
+        + hidden
+            .iter()
+            .zip(generated_mcts_prior::OUTPUT_WEIGHT)
+            .map(|(&value, weight)| value * weight)
+            .sum::<f32>()
 }
 
 fn select_mcts_action(node: &MctsNode, exploration: f64) -> usize {
@@ -717,9 +933,89 @@ fn rule_playout_after_tilt(
     input: &Input,
     actions: &[u8; CANDY_COUNT],
     ranks: &[u8; CANDY_COUNT],
+    rollout_depth: usize,
+    tail_repair_turns: usize,
+    tail_repair_passes: usize,
+) -> usize {
+    if tail_repair_turns <= 1 {
+        return rule_playout_after_tilt_legacy(
+            board,
+            placed,
+            input,
+            actions,
+            ranks,
+            rollout_depth,
+            tail_repair_turns == 1,
+        );
+    }
+    let last_action = if rollout_depth == 0 {
+        CANDY_COUNT - 2
+    } else {
+        (placed + rollout_depth - 1).min(CANDY_COUNT - 2)
+    };
+    let terminal = last_action == CANDY_COUNT - 2;
+    let mut repaired_actions = *actions;
+    let repair_start = placed.max((last_action + 1).saturating_sub(tail_repair_turns));
+    let mut boards_before_action = Vec::with_capacity(last_action + 1 - repair_start);
+    let mut best_score = 0;
+
+    for pass in 0..tail_repair_passes {
+        boards_before_action.clear();
+        let mut result = *board;
+        for position in placed..=last_action {
+            result = place_on_board_at_rank(
+                &result,
+                ranks[position] as usize,
+                input.flavors()[position],
+            );
+            if position >= repair_start {
+                boards_before_action.push(result);
+            }
+            result = tilt(&result, repaired_actions[position] as usize);
+        }
+        if terminal {
+            result = place_on_board_at_rank(&result, 1, input.flavors()[CANDY_COUNT - 1]);
+        }
+        if pass == 0 {
+            best_score = scaled_playout_score(&result, input, last_action, terminal);
+        }
+
+        for position in (repair_start..=last_action).rev() {
+            let original = repaired_actions[position];
+            let mut best_action = original;
+            for action in 0..ACTION_COUNT {
+                repaired_actions[position] = action as u8;
+                let score = replay_playout_suffix(
+                    &boards_before_action[position - repair_start],
+                    position,
+                    last_action,
+                    terminal,
+                    input,
+                    &repaired_actions,
+                    ranks,
+                );
+                if score > best_score {
+                    best_score = score;
+                    best_action = action as u8;
+                }
+            }
+            repaired_actions[position] = best_action;
+        }
+    }
+    best_score
+}
+
+fn rule_playout_after_tilt_legacy(
+    board: &Board,
+    placed: usize,
+    input: &Input,
+    actions: &[u8; CANDY_COUNT],
+    ranks: &[u8; CANDY_COUNT],
+    rollout_depth: usize,
     exact_last_action: bool,
 ) -> usize {
     let mut result = *board;
+    let mut actions_played = 0;
     for position in placed..CANDY_COUNT {
         let empty_count = CANDY_COUNT - position;
         result =
@@ -731,8 +1027,47 @@ fn rule_playout_after_tilt(
             return connectivity_numerator(&result);
         }
         result = tilt(&result, actions[position] as usize);
+        actions_played += 1;
+        if rollout_depth > 0 && actions_played >= rollout_depth {
+            let partial_denominator = input.prefix_denominator(position + 1);
+            let final_denominator: usize = input.totals().iter().map(|count| count * count).sum();
+            return connectivity_numerator(&result) * final_denominator / partial_denominator;
+        }
     }
     unreachable!()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_playout_suffix(
+    board_before_action: &Board,
+    first_action: usize,
+    last_action: usize,
+    terminal: bool,
+    input: &Input,
+    actions: &[u8; CANDY_COUNT],
+    ranks: &[u8; CANDY_COUNT],
+) -> usize {
+    let mut result = tilt(board_before_action, actions[first_action] as usize);
+    for position in first_action + 1..=last_action {
+        result =
+            place_on_board_at_rank(&result, ranks[position] as usize, input.flavors()[position]);
+        result = tilt(&result, actions[position] as usize);
+    }
+    if terminal {
+        result = place_on_board_at_rank(&result, 1, input.flavors()[CANDY_COUNT - 1]);
+    }
+    scaled_playout_score(&result, input, last_action, terminal)
+}
+
+fn scaled_playout_score(board: &Board, input: &Input, last_action: usize, terminal: bool) -> usize {
+    let score = connectivity_numerator(board);
+    if terminal {
+        score
+    } else {
+        let partial_denominator = input.prefix_denominator(last_action + 1);
+        let final_denominator: usize = input.totals().iter().map(|count| count * count).sum();
+        score * final_denominator / partial_denominator
+    }
 }
 
 fn optimal_last_action_score(board: &Board, final_flavor: u8) -> usize {
@@ -927,6 +1262,13 @@ mod tests {
             mcts_simulations: 0,
             mcts_exploration: 0.0,
             mcts_prior: MctsPrior::Connectivity,
+            mcts_early_prior: MctsPrior::Connectivity,
+            mcts_rollout_depth: 0,
+            mcts_rollout_cutoff_until: CANDY_COUNT,
+            mcts_tail_repair_turns: 2,
+            mcts_tail_repair_passes: 1,
+            mcts_early_simulations: 0,
+            mcts_early_min_gain: 20.0,
             time_limit: Duration::from_secs(2),
             time_reserve: Duration::from_millis(100),
         };
@@ -959,15 +1301,43 @@ mod tests {
 
     #[test]
     fn mcts_backpropagation_updates_a_shared_dag_node() {
+        let input = Input::new([1; CANDY_COUNT]);
         let board = [0; CANDY_COUNT];
         let mut table = MctsTable::default();
-        table.insert(board, new_mcts_node(&board, MctsPrior::Uniform));
+        table.insert(board, new_mcts_node(&board, MctsPrior::Uniform, &input, 1));
         mcts_backpropagate(&mut table, &[(board, LEFT)], 123);
         mcts_backpropagate(&mut table, &[(board, LEFT)], 321);
         assert_eq!(table.len(), 1);
         assert_eq!(table[&board].visits, 2);
         assert_eq!(table[&board].action_visits[LEFT], 2);
         assert_eq!(table[&board].action_sums[LEFT], 444);
+    }
+
+    #[test]
+    fn cutoff_projection_preserves_a_perfect_single_flavor_board() {
+        let input = Input::new([1; CANDY_COUNT]);
+        let mut board = [0; CANDY_COUNT];
+        board[..80].fill(1);
+        let actions = [FRONT as u8; CANDY_COUNT];
+        let ranks = [1; CANDY_COUNT];
+        assert_eq!(
+            rule_playout_after_tilt(&board, 80, &input, &actions, &ranks, 4, 0, 1),
+            10_000
+        );
+    }
+
+    #[test]
+    fn repairing_more_tail_actions_does_not_reduce_playout_score() {
+        let input = Input::new(std::array::from_fn(|index| (index % 3 + 1) as u8));
+        let mut board = [0; CANDY_COUNT];
+        for (index, cell) in board.iter_mut().take(94).enumerate() {
+            *cell = (index % 3 + 1) as u8;
+        }
+        let actions = std::array::from_fn(|index| (index % ACTION_COUNT) as u8);
+        let ranks = [1; CANDY_COUNT];
+        let one = rule_playout_after_tilt(&board, 94, &input, &actions, &ranks, 0, 1, 1);
+        let four = rule_playout_after_tilt(&board, 94, &input, &actions, &ranks, 0, 4, 1);
+        assert!(four >= one);
     }
 
     #[test]

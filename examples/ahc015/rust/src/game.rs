@@ -25,22 +25,26 @@ pub struct Input {
     flavors: [u8; CANDY_COUNT],
     totals: [usize; 3],
     first_positions: [usize; 3],
+    prefix_denominators: [usize; CANDY_COUNT + 1],
 }
 
 impl Input {
     pub fn new(flavors: [u8; CANDY_COUNT]) -> Self {
         let mut totals = [0; 3];
         let mut first_positions = [usize::MAX; 3];
+        let mut prefix_denominators = [0; CANDY_COUNT + 1];
         for (index, &flavor) in flavors.iter().enumerate() {
             assert!((1..=3).contains(&flavor));
             let flavor = flavor as usize - 1;
             totals[flavor] += 1;
             first_positions[flavor] = first_positions[flavor].min(index);
+            prefix_denominators[index + 1] = totals.iter().map(|count| count * count).sum();
         }
         Self {
             flavors,
             totals,
             first_positions,
+            prefix_denominators,
         }
     }
 
@@ -54,6 +58,10 @@ impl Input {
 
     pub fn first_positions(&self) -> [usize; 3] {
         self.first_positions
+    }
+
+    pub fn prefix_denominator(&self, placed: usize) -> usize {
+        self.prefix_denominators[placed]
     }
 }
 

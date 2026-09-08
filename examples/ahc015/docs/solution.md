@@ -188,8 +188,17 @@ afterstate版は16,656.832点高く、固定512ケースのbestでもpre-tilt版
   同じ盤面へ到達した場合はvisit数と価値を共有するDAGとする。未訪問手は局所連結度の順位で展開し、その後は
   PUCTで選択する。leafは24通りのルール方策（味の役割6 permutation × 盤面4 rotation）でplayoutする。
   各初手には同じ将来配置列と同じルールを適用し、モデルの第一候補を覆すには連結度分子で20以上の推定改善を
-  要求する。直後2配置のrank組は一巡まで重複しないよう層化する。99個目を配置した後は、最後に盤面へ影響する
-  方向を4方向の終端連結度から厳密に選ぶ。
+  要求する。直後2配置のrank組は一巡まで重複しないよう層化する。playout完了後は、そのsimulationで判明した
+  配置rank列を固定し、末尾2方向を後ろから各4通り試して終端連結度が改善する方向へ1回だけ置き換える。
+  3手以上の修正や複数回の反復は、simulation内の未来配置への過適合が強くなり実スコアを下げた。
+  修正長と反復回数は`--mcts-tail-repair-turns`と`--mcts-tail-repair-passes`で再実験できる。
+- `--mcts-rollout-depth N`でleaf playoutをN手後に打ち切り、部分盤面の連結度を味別配置数で正規化して
+  終局尺度へ射影できる。実験では終局までplayoutする方が良かったため、デフォルトは`0`（打ち切りなし）。
+  `--mcts-rollout-cutoff-until`、`--mcts-early-simulations`、`--mcts-early-min-gain`を併用すると、指定手数
+  より前だけ短期playoutと専用の探索量・上書き閾値を使える。
+- `--mcts-prior tiny-nn`では、連結成分、最大成分、成分数、空きマスとの接触辺、外周を含む露出辺を入力する
+  289 parameterの共有MLPをpriorに使える。128 channel actorから蒸留した実験モデルは改善しなかったため、
+  提出時のデフォルトは`connectivity`を維持する。
 - 固定sample上限に加え、残時間を残りのモンテカルロ手数で割ったdeadlineで打ち切る。`--mc-turns 0` と
   `--exact-turns 0`でそれぞれ無効化できる。
 - future rank列とルールの行動列を事前計算し、終端連結度は3味の`u128` bitboard flood fillで求める。

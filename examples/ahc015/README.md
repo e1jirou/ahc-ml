@@ -35,7 +35,9 @@ PYTHONPATH=python .venv/bin/python -m examples.ahc015.python.evaluate \
 提出器は最良の actor を int8 量子化して Rust に埋め込む。終盤は80〜92手目にMCTS、
 93手目以降に7手の厳密 expectimax を使う。詳細と検証結果は `docs/solution.md` を参照する。
 MCTSは盤面hashで同一局面をDAGへ統合し、直後2配置のrank組を層化する。展開時は24ルールでplayoutし、
-手のpriorには局所連結度の順位を使う。最後に盤面へ影響する方向は4方向から厳密に選ぶ。
+手のpriorには局所連結度の順位を使う。playout後は末尾2方向を後ろから局所的に修正する。
+構造特徴を128 channel actorから蒸留する小型NN priorも実験可能だが、評価では改善しなかったため提出設定では
+使用しない。
 
 ```bash
 PYTHONPATH=python .venv/bin/python -m examples.ahc015.python.export \

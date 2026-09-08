@@ -61,10 +61,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rust-mcts-simulations", type=int, default=2560)
     parser.add_argument("--rust-mcts-exploration", type=float, default=700.0)
     parser.add_argument(
-        "--rust-mcts-prior", choices=("uniform", "connectivity"), default="connectivity"
+        "--rust-mcts-prior",
+        choices=("uniform", "connectivity", "tiny-nn"),
+        default="connectivity",
     )
-    parser.add_argument("--rust-time-limit-ms", type=int, default=1800)
-    parser.add_argument("--rust-time-reserve-ms", type=int, default=200)
+    parser.add_argument(
+        "--rust-mcts-early-prior",
+        choices=("uniform", "connectivity", "tiny-nn"),
+        default="connectivity",
+    )
+    parser.add_argument("--rust-mcts-rollout-depth", type=int, default=0)
+    parser.add_argument("--rust-mcts-rollout-cutoff-until", type=int, default=100)
+    parser.add_argument("--rust-mcts-tail-repair-turns", type=int, default=2)
+    parser.add_argument("--rust-mcts-tail-repair-passes", type=int, default=1)
+    parser.add_argument("--rust-mcts-early-simulations", type=int, default=0)
+    parser.add_argument("--rust-mcts-early-min-gain", type=float, default=20.0)
+    parser.add_argument("--rust-time-limit-ms", type=int, default=1400)
+    parser.add_argument("--rust-time-reserve-ms", type=int, default=300)
     return parser.parse_args()
 
 
@@ -93,6 +106,13 @@ def evaluate_rust_case(
     mcts_simulations: int,
     mcts_exploration: float,
     mcts_prior: str,
+    mcts_early_prior: str,
+    mcts_rollout_depth: int,
+    mcts_rollout_cutoff_until: int,
+    mcts_tail_repair_turns: int,
+    mcts_tail_repair_passes: int,
+    mcts_early_simulations: int,
+    mcts_early_min_gain: float,
     time_limit_ms: int,
     time_reserve_ms: int,
 ) -> int:
@@ -113,6 +133,13 @@ def evaluate_rust_case(
     command.extend(("--mcts-simulations", str(mcts_simulations)))
     command.extend(("--mcts-exploration", str(mcts_exploration)))
     command.extend(("--mcts-prior", mcts_prior))
+    command.extend(("--mcts-early-prior", mcts_early_prior))
+    command.extend(("--mcts-rollout-depth", str(mcts_rollout_depth)))
+    command.extend(("--mcts-rollout-cutoff-until", str(mcts_rollout_cutoff_until)))
+    command.extend(("--mcts-tail-repair-turns", str(mcts_tail_repair_turns)))
+    command.extend(("--mcts-tail-repair-passes", str(mcts_tail_repair_passes)))
+    command.extend(("--mcts-early-simulations", str(mcts_early_simulations)))
+    command.extend(("--mcts-early-min-gain", str(mcts_early_min_gain)))
     command.extend(("--time-limit-ms", str(time_limit_ms)))
     command.extend(("--time-reserve-ms", str(time_reserve_ms)))
     completed = subprocess.run(
@@ -148,12 +175,19 @@ def evaluate_rust_policy(
     mc_strategy: str = "equal",
     mc_stratified_turns: int = 2,
     mc_exact_last_action: bool = True,
-    endgame_search: str = "mc",
+    endgame_search: str = "mcts",
     mcts_simulations: int = 2560,
     mcts_exploration: float = 700.0,
     mcts_prior: str = "connectivity",
-    time_limit_ms: int = 1800,
-    time_reserve_ms: int = 200,
+    mcts_early_prior: str = "connectivity",
+    mcts_rollout_depth: int = 0,
+    mcts_rollout_cutoff_until: int = 100,
+    mcts_tail_repair_turns: int = 2,
+    mcts_tail_repair_passes: int = 1,
+    mcts_early_simulations: int = 0,
+    mcts_early_min_gain: float = 20.0,
+    time_limit_ms: int = 1400,
+    time_reserve_ms: int = 300,
 ) -> np.ndarray:
     if workers <= 0:
         raise ValueError("--rust-workers must be positive")
@@ -182,6 +216,13 @@ def evaluate_rust_policy(
                 mcts_simulations,
                 mcts_exploration,
                 mcts_prior,
+                mcts_early_prior,
+                mcts_rollout_depth,
+                mcts_rollout_cutoff_until,
+                mcts_tail_repair_turns,
+                mcts_tail_repair_passes,
+                mcts_early_simulations,
+                mcts_early_min_gain,
                 time_limit_ms,
                 time_reserve_ms,
             ),
@@ -212,6 +253,18 @@ def main() -> None:
         raise ValueError("--rust-mcts-simulations must be nonnegative")
     if args.rust_mcts_exploration < 0:
         raise ValueError("--rust-mcts-exploration must be nonnegative")
+    if not 0 <= args.rust_mcts_rollout_depth <= 100:
+        raise ValueError("--rust-mcts-rollout-depth must be in [0, 100]")
+    if not 0 <= args.rust_mcts_rollout_cutoff_until <= 100:
+        raise ValueError("--rust-mcts-rollout-cutoff-until must be in [0, 100]")
+    if not 0 <= args.rust_mcts_tail_repair_turns <= 100:
+        raise ValueError("--rust-mcts-tail-repair-turns must be in [0, 100]")
+    if not 1 <= args.rust_mcts_tail_repair_passes <= 10:
+        raise ValueError("--rust-mcts-tail-repair-passes must be in [1, 10]")
+    if args.rust_mcts_early_simulations < 0:
+        raise ValueError("--rust-mcts-early-simulations must be nonnegative")
+    if args.rust_mcts_early_min_gain < 0:
+        raise ValueError("--rust-mcts-early-min-gain must be nonnegative")
     if not 0 <= args.rust_time_reserve_ms < args.rust_time_limit_ms:
         raise ValueError("Rust time reserve must be nonnegative and smaller than the limit")
     device, _ = select_device(args.device)
@@ -302,6 +355,13 @@ def main() -> None:
             args.rust_mcts_simulations,
             args.rust_mcts_exploration,
             args.rust_mcts_prior,
+            args.rust_mcts_early_prior,
+            args.rust_mcts_rollout_depth,
+            args.rust_mcts_rollout_cutoff_until,
+            args.rust_mcts_tail_repair_turns,
+            args.rust_mcts_tail_repair_passes,
+            args.rust_mcts_early_simulations,
+            args.rust_mcts_early_min_gain,
             args.rust_time_limit_ms,
             args.rust_time_reserve_ms,
         )
