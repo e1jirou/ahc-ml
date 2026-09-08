@@ -50,6 +50,18 @@ enum McStrategy {
     Halving,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum EndgameSearch {
+    MonteCarlo,
+    Mcts,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum MctsPrior {
+    Uniform,
+    Connectivity,
+}
+
 struct SearchSettings {
     exact_turns: usize,
     mc_turns: usize,
@@ -59,6 +71,10 @@ struct SearchSettings {
     mc_strategy: McStrategy,
     mc_stratified_turns: usize,
     mc_exact_last_action: bool,
+    endgame_search: EndgameSearch,
+    mcts_simulations: u64,
+    mcts_exploration: f64,
+    mcts_prior: MctsPrior,
     time_limit: Duration,
     time_reserve: Duration,
 }
@@ -102,14 +118,18 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
     let mut arguments = env::args().skip(1);
     let mut model_path = None;
     let mut exact_turns = DEFAULT_EXACT_TURNS;
-    let mut mc_turns = 12;
+    let mut mc_turns = 20;
     let mut mc_actions = 4;
     let mut mc_samples = 96;
     let mut mc_min_gain = 20.0;
     let mut mc_strategy = McStrategy::Equal;
     let mut mc_stratified_turns = 2;
     let mut mc_exact_last_action = true;
-    let mut time_limit_ms = 1900;
+    let mut endgame_search = EndgameSearch::Mcts;
+    let mut mcts_simulations = 2560;
+    let mut mcts_exploration = 700.0;
+    let mut mcts_prior = MctsPrior::Connectivity;
+    let mut time_limit_ms = 1800;
     let mut time_reserve_ms = 200;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -171,6 +191,29 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
                     _ => return Err("--mc-exact-last-action must be 0 or 1".to_string()),
                 };
             }
+            "--endgame-search" => {
+                endgame_search = match arguments.next().as_deref() {
+                    Some("mc") => EndgameSearch::MonteCarlo,
+                    Some("mcts") => EndgameSearch::Mcts,
+                    _ => return Err("--endgame-search must be mc or mcts".to_string()),
+                };
+            }
+            "--mcts-simulations" => {
+                mcts_simulations = parse_next(&mut arguments, "--mcts-simulations")?;
+            }
+            "--mcts-exploration" => {
+                mcts_exploration = parse_next(&mut arguments, "--mcts-exploration")?;
+                if mcts_exploration < 0.0 {
+                    return Err("--mcts-exploration must be nonnegative".to_string());
+                }
+            }
+            "--mcts-prior" => {
+                mcts_prior = match arguments.next().as_deref() {
+                    Some("uniform") => MctsPrior::Uniform,
+                    Some("connectivity") => MctsPrior::Connectivity,
+                    _ => return Err("--mcts-prior must be uniform or connectivity".to_string()),
+                };
+            }
             "--time-limit-ms" => {
                 time_limit_ms = parse_next(&mut arguments, "--time-limit-ms")?;
             }
@@ -202,6 +245,10 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
             mc_strategy,
             mc_stratified_turns,
             mc_exact_last_action,
+            endgame_search,
+            mcts_simulations,
+            mcts_exploration,
+            mcts_prior,
             time_limit: Duration::from_millis(time_limit_ms),
             time_reserve: Duration::from_millis(time_reserve_ms),
         },
@@ -259,15 +306,27 @@ fn choose_action(
         let now = Instant::now();
         if now < search_deadline {
             let turn_budget = search_deadline.duration_since(now) / remaining_mc_turns as u32;
-            return Ok(monte_carlo_action(
-                &candidates,
-                &residuals,
-                state.placed(),
-                input,
-                rule_actions,
-                settings,
-                now + turn_budget,
-            ));
+            let deadline = now + turn_budget;
+            return Ok(match settings.endgame_search {
+                EndgameSearch::MonteCarlo => monte_carlo_action(
+                    &candidates,
+                    &residuals,
+                    state.placed(),
+                    input,
+                    rule_actions,
+                    settings,
+                    deadline,
+                ),
+                EndgameSearch::Mcts => mcts_action(
+                    &candidates,
+                    &residuals,
+                    state.placed(),
+                    input,
+                    rule_actions,
+                    settings,
+                    deadline,
+                ),
+            });
         }
     }
     let mut best_action = FRONT;
@@ -280,6 +339,195 @@ fn choose_action(
         }
     }
     Ok(best_action)
+}
+
+#[derive(Clone)]
+struct MctsNode {
+    visits: u32,
+    action_visits: [u32; ACTION_COUNT],
+    action_sums: [u64; ACTION_COUNT],
+    priorities: [u8; ACTION_COUNT],
+}
+
+type MctsTable = HashMap<Board, MctsNode, BuildHasherDefault<FastHasher>>;
+
+fn mcts_action(
+    candidates: &[Board; ACTION_COUNT],
+    model_values: &[f32],
+    placed: usize,
+    input: &Input,
+    rule_actions: &[[u8; CANDY_COUNT]; 24],
+    settings: &SearchSettings,
+    deadline: Instant,
+) -> usize {
+    let model_action = (0..ACTION_COUNT)
+        .max_by(|&left, &right| {
+            model_values[left]
+                .total_cmp(&model_values[right])
+                .then_with(|| right.cmp(&left))
+        })
+        .unwrap();
+    let mut roots = (0..ACTION_COUNT).collect::<Vec<_>>();
+    roots.sort_by(|&left, &right| {
+        model_values[right]
+            .total_cmp(&model_values[left])
+            .then_with(|| left.cmp(&right))
+    });
+    roots.truncate(settings.mc_actions);
+
+    let mut table = MctsTable::default();
+    let mut sums = [0u64; ACTION_COUNT];
+    let mut visits = [0u32; ACTION_COUNT];
+    let mut simulation = 0u64;
+    'search: loop {
+        // One common random stream and rollout rule is applied to every root action.
+        let ranks = playout_ranks(placed, simulation, settings.mc_stratified_turns);
+        let rule = simulation as usize % rule_actions.len();
+        for &root in &roots {
+            let score = mcts_simulation(
+                &candidates[root],
+                placed,
+                input,
+                &rule_actions[rule],
+                &ranks,
+                settings.mcts_exploration,
+                settings.mcts_prior,
+                settings.mc_exact_last_action,
+                &mut table,
+            );
+            sums[root] += score as u64;
+            visits[root] += 1;
+            if Instant::now() >= deadline {
+                break 'search;
+            }
+        }
+        simulation += 1;
+        if settings.mcts_simulations > 0 && simulation >= settings.mcts_simulations {
+            break;
+        }
+    }
+    let best_action = roots
+        .iter()
+        .copied()
+        .filter(|&action| visits[action] > 0)
+        .max_by(|&left, &right| {
+            let left_scaled = sums[left] as u128 * visits[right] as u128;
+            let right_scaled = sums[right] as u128 * visits[left] as u128;
+            left_scaled
+                .cmp(&right_scaled)
+                .then_with(|| right.cmp(&left))
+        })
+        .unwrap_or(model_action);
+    if visits[best_action] == 0 || visits[model_action] == 0 {
+        return model_action;
+    }
+    let best_mean = sums[best_action] as f64 / visits[best_action] as f64;
+    let model_mean = sums[model_action] as f64 / visits[model_action] as f64;
+    if best_mean >= model_mean + settings.mc_min_gain {
+        best_action
+    } else {
+        model_action
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mcts_simulation(
+    root: &Board,
+    placed: usize,
+    input: &Input,
+    rollout_actions: &[u8; CANDY_COUNT],
+    ranks: &[u8; CANDY_COUNT],
+    exploration: f64,
+    prior: MctsPrior,
+    exact_last_action: bool,
+    table: &mut MctsTable,
+) -> usize {
+    let mut board = *root;
+    let mut path = [([0; CANDY_COUNT], 0); CANDY_COUNT];
+    for (depth, position) in (placed..CANDY_COUNT).enumerate() {
+        board = place_on_board_at_rank(&board, ranks[position] as usize, input.flavors()[position]);
+        if position + 1 == CANDY_COUNT {
+            let score = connectivity_numerator(&board);
+            mcts_backpropagate(table, &path[..depth], score);
+            return score;
+        }
+
+        let is_new = !table.contains_key(&board);
+        if is_new {
+            table.insert(board, new_mcts_node(&board, prior));
+        }
+        let action = select_mcts_action(table.get(&board).unwrap(), exploration);
+        let edge_unvisited = table.get(&board).unwrap().action_visits[action] == 0;
+        path[depth] = (board, action);
+        board = tilt(&board, action);
+        if is_new || edge_unvisited {
+            let score = rule_playout_after_tilt(
+                &board,
+                position + 1,
+                input,
+                rollout_actions,
+                ranks,
+                exact_last_action,
+            );
+            mcts_backpropagate(table, &path[..=depth], score);
+            return score;
+        }
+    }
+    unreachable!()
+}
+
+fn new_mcts_node(board: &Board, prior: MctsPrior) -> MctsNode {
+    if prior == MctsPrior::Uniform {
+        return MctsNode {
+            visits: 0,
+            action_visits: [0; ACTION_COUNT],
+            action_sums: [0; ACTION_COUNT],
+            priorities: [1; ACTION_COUNT],
+        };
+    }
+    let mut actions = [FRONT, BACK, LEFT, RIGHT];
+    actions.sort_by_key(|&action| std::cmp::Reverse(connectivity_numerator(&tilt(board, action))));
+    let mut priorities = [0; ACTION_COUNT];
+    for (rank, action) in actions.into_iter().enumerate() {
+        priorities[action] = (ACTION_COUNT - rank) as u8;
+    }
+    MctsNode {
+        visits: 0,
+        action_visits: [0; ACTION_COUNT],
+        action_sums: [0; ACTION_COUNT],
+        priorities,
+    }
+}
+
+fn select_mcts_action(node: &MctsNode, exploration: f64) -> usize {
+    if let Some(action) = (0..ACTION_COUNT)
+        .filter(|&action| node.action_visits[action] == 0)
+        .max_by_key(|&action| (node.priorities[action], std::cmp::Reverse(action)))
+    {
+        return action;
+    }
+    let root = (node.visits as f64).sqrt();
+    (0..ACTION_COUNT)
+        .max_by(|&left, &right| {
+            let value = |action: usize| {
+                node.action_sums[action] as f64 / node.action_visits[action] as f64
+                    + exploration * node.priorities[action] as f64 * root
+                        / (10.0 * (node.action_visits[action] + 1) as f64)
+            };
+            value(left)
+                .total_cmp(&value(right))
+                .then_with(|| right.cmp(&left))
+        })
+        .unwrap()
+}
+
+fn mcts_backpropagate(table: &mut MctsTable, path: &[(Board, usize)], score: usize) {
+    for &(board, action) in path {
+        let node = table.get_mut(&board).unwrap();
+        node.visits += 1;
+        node.action_visits[action] += 1;
+        node.action_sums[action] += score as u64;
+    }
 }
 
 #[derive(Clone)]
@@ -461,6 +709,30 @@ fn rule_playout(
         result = tilt(&result, actions[position] as usize);
     }
     connectivity_numerator(&result)
+}
+
+fn rule_playout_after_tilt(
+    board: &Board,
+    placed: usize,
+    input: &Input,
+    actions: &[u8; CANDY_COUNT],
+    ranks: &[u8; CANDY_COUNT],
+    exact_last_action: bool,
+) -> usize {
+    let mut result = *board;
+    for position in placed..CANDY_COUNT {
+        let empty_count = CANDY_COUNT - position;
+        result =
+            place_on_board_at_rank(&result, ranks[position] as usize, input.flavors()[position]);
+        if exact_last_action && empty_count == 2 {
+            return optimal_last_action_score(&result, input.flavors()[position + 1]);
+        }
+        if empty_count == 1 {
+            return connectivity_numerator(&result);
+        }
+        result = tilt(&result, actions[position] as usize);
+    }
+    unreachable!()
 }
 
 fn optimal_last_action_score(board: &Board, final_flavor: u8) -> usize {
@@ -651,6 +923,10 @@ mod tests {
             mc_strategy: McStrategy::Equal,
             mc_stratified_turns: 0,
             mc_exact_last_action: false,
+            endgame_search: EndgameSearch::MonteCarlo,
+            mcts_simulations: 0,
+            mcts_exploration: 0.0,
+            mcts_prior: MctsPrior::Connectivity,
             time_limit: Duration::from_secs(2),
             time_reserve: Duration::from_millis(100),
         };
@@ -679,6 +955,19 @@ mod tests {
             exact_future_sum(&board, 96, &input, &mut cache),
             24 * 10_000
         );
+    }
+
+    #[test]
+    fn mcts_backpropagation_updates_a_shared_dag_node() {
+        let board = [0; CANDY_COUNT];
+        let mut table = MctsTable::default();
+        table.insert(board, new_mcts_node(&board, MctsPrior::Uniform));
+        mcts_backpropagate(&mut table, &[(board, LEFT)], 123);
+        mcts_backpropagate(&mut table, &[(board, LEFT)], 321);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[&board].visits, 2);
+        assert_eq!(table[&board].action_visits[LEFT], 2);
+        assert_eq!(table[&board].action_sums[LEFT], 444);
     }
 
     #[test]

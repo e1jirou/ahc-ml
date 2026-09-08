@@ -32,11 +32,10 @@ PYTHONPATH=python .venv/bin/python -m examples.ahc015.python.evaluate \
   --checkpoint outputs/ahc015/<run-name>/best.pt --episodes 2000 --seed 20260826
 ```
 
-提出器は最良の actor を int8 量子化して Rust に埋め込む。終盤は88〜92手目にモンテカルロ探索、
+提出器は最良の actor を int8 量子化して Rust に埋め込む。終盤は80〜92手目にMCTS、
 93手目以降に7手の厳密 expectimax を使う。詳細と検証結果は `docs/solution.md` を参照する。
-playoutでは未来rank列・24ルールの行動列・共通の初回配置を再利用し、終端連結度を`u128` bitboardで
-計算する。直後2配置のrank組を層化し、最後に盤面へ影響する方向は4方向から厳密に選ぶ。各ルール96 sample
-を使う。
+MCTSは盤面hashで同一局面をDAGへ統合し、直後2配置のrank組を層化する。展開時は24ルールでplayoutし、
+手のpriorには局所連結度の順位を使う。最後に盤面へ影響する方向は4方向から厳密に選ぶ。
 
 ```bash
 PYTHONPATH=python .venv/bin/python -m examples.ahc015.python.export \
