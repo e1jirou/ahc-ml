@@ -65,7 +65,6 @@ from examples.ahc015.python.model import (
     STUDENT_PARAMETER_COUNT,
     STUDENT_RESIDUAL_BLOCKS,
     TEACHER_PARAMETER_COUNT,
-    TEACHER_RESIDUAL_BLOCKS,
     Ahc015PpoNet,
     Ahc015ValueNet,
     parameter_count,
@@ -220,7 +219,7 @@ def test_config_and_ppo_model_shapes() -> None:
     assert ppo_config.model.input_mode == "afterstate"
     assert ppo_config.model.channels == 128
     assert ppo_config.model.residual_blocks == 10
-    assert ppo_config.training.max_hours == 9.5
+    assert ppo_config.training.max_hours == 10.0
     assert ppo_config.training.rollout_episodes == 4096
     assert ppo_config.training.batch_size == 1024
     assert ppo_config.training.micro_batch_size == 512
@@ -232,13 +231,13 @@ def test_config_and_ppo_model_shapes() -> None:
     assert distill_config.run.name_prefix == "distill"
     continue_config = load_config(config_directory / "config_ppo.toml")
     assert continue_config.run.name_prefix == "large"
-    assert continue_config.run.seed == 15047
+    assert continue_config.run.seed == 15048
     assert continue_config.run.device == "cuda"
     assert continue_config.model.input_mode == "afterstate"
     assert continue_config.model.future_mode == "none"
     assert continue_config.model.channels == 128
     assert continue_config.model.residual_blocks == 10
-    assert continue_config.training.max_hours == 9.5
+    assert continue_config.training.max_hours == 10.0
     assert continue_config.training.rollout_episodes == 4096
     assert continue_config.training.data_parallel is True
     assert continue_config.training.rollout_processes == 2

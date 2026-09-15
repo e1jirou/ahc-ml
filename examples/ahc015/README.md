@@ -17,7 +17,8 @@
 - `config_distill.toml`: 蒸留段階。PPO の potential shaping と policy `alpha=0` を維持し、
   actor の `KL(teacher || student)` 係数を実時間3時間で `1` から `0` に線形減衰する。critic は蒸留しない。
 - `config_ppo.toml`: PPO 継続段階。future mode は `none`、global microbatch は512、
-  学習率は `2.5e-4`。学習状況を見て学習率を減衰させる。
+  学習率は `2.5e-4`。現在は`large-20260907-043010`のepoch 483のlast checkpointから
+  10時間継続する。
 
 `best.pt` は actor 単体、`best-training.pt` と `last.pt` は actor・critic・optimizer を含む再開用
 checkpoint である。継続学習には、最良性能を使うときは `best-training.pt`、学習軌跡をつなぐときは
