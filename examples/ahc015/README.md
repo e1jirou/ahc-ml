@@ -33,10 +33,11 @@ PYTHONPATH=python .venv/bin/python -m examples.ahc015.python.evaluate \
   --checkpoint outputs/ahc015/<run-name>/best.pt --episodes 2000 --seed 20260826
 ```
 
-提出器は最良の actor を int8 量子化して Rust に埋め込む。終盤は80〜92手目にMCTS、
+提出器は`large-20260924-012153`のepoch 973のbest actorをint8量子化してRustに埋め込む。
+終盤は86〜92手目にMCTS、
 93手目以降に7手の厳密 expectimax を使う。詳細と検証結果は `docs/solution.md` を参照する。
 MCTSは盤面hashで同一局面をDAGへ統合し、直後2配置のrank組を層化する。展開時は24ルールでplayoutし、
-手のpriorには局所連結度の順位を使う。playout後は末尾2方向を後ろから局所的に修正する。
+手のpriorには局所連結度の順位を使う。playout後は末尾3方向を後ろから局所的に修正する。
 構造特徴を128 channel actorから蒸留する小型NN priorも実験可能だが、評価では改善しなかったため提出設定では
 使用しない。
 

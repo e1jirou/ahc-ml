@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         default=7,
         help="number of final decision turns evaluated by exact expectimax",
     )
-    parser.add_argument("--rust-mc-turns", type=int, default=20)
+    parser.add_argument("--rust-mc-turns", type=int, default=14)
     parser.add_argument("--rust-mc-actions", type=int, default=4)
     parser.add_argument("--rust-mc-samples", type=int, default=96)
     parser.add_argument("--rust-mc-min-gain", type=float, default=20.0)
@@ -58,8 +58,8 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--rust-endgame-search", choices=("mc", "mcts"), default="mcts")
-    parser.add_argument("--rust-mcts-simulations", type=int, default=2560)
-    parser.add_argument("--rust-mcts-exploration", type=float, default=700.0)
+    parser.add_argument("--rust-mcts-simulations", type=int, default=2048)
+    parser.add_argument("--rust-mcts-exploration", type=float, default=550.0)
     parser.add_argument(
         "--rust-mcts-prior",
         choices=("uniform", "connectivity", "tiny-nn"),
@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rust-mcts-rollout-depth", type=int, default=0)
     parser.add_argument("--rust-mcts-rollout-cutoff-until", type=int, default=100)
-    parser.add_argument("--rust-mcts-tail-repair-turns", type=int, default=2)
+    parser.add_argument("--rust-mcts-tail-repair-turns", type=int, default=3)
     parser.add_argument("--rust-mcts-tail-repair-passes", type=int, default=1)
     parser.add_argument("--rust-mcts-early-simulations", type=int, default=0)
     parser.add_argument("--rust-mcts-early-min-gain", type=float, default=20.0)
@@ -168,7 +168,7 @@ def evaluate_rust_policy(
     ranks: np.ndarray,
     workers: int,
     exact_turns: int,
-    mc_turns: int = 20,
+    mc_turns: int = 14,
     mc_actions: int = 4,
     mc_samples: int = 96,
     mc_min_gain: float = 20.0,
@@ -176,13 +176,13 @@ def evaluate_rust_policy(
     mc_stratified_turns: int = 2,
     mc_exact_last_action: bool = True,
     endgame_search: str = "mcts",
-    mcts_simulations: int = 2560,
-    mcts_exploration: float = 700.0,
+    mcts_simulations: int = 2048,
+    mcts_exploration: float = 550.0,
     mcts_prior: str = "connectivity",
     mcts_early_prior: str = "connectivity",
     mcts_rollout_depth: int = 0,
     mcts_rollout_cutoff_until: int = 100,
-    mcts_tail_repair_turns: int = 2,
+    mcts_tail_repair_turns: int = 3,
     mcts_tail_repair_passes: int = 1,
     mcts_early_simulations: int = 0,
     mcts_early_min_gain: float = 20.0,

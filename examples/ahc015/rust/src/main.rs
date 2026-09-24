@@ -127,7 +127,7 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
     let mut arguments = env::args().skip(1);
     let mut model_path = None;
     let mut exact_turns = DEFAULT_EXACT_TURNS;
-    let mut mc_turns = 20;
+    let mut mc_turns = 14;
     let mut mc_actions = 4;
     let mut mc_samples = 96;
     let mut mc_min_gain = 20.0;
@@ -135,13 +135,13 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
     let mut mc_stratified_turns = 2;
     let mut mc_exact_last_action = true;
     let mut endgame_search = EndgameSearch::Mcts;
-    let mut mcts_simulations = 2560;
-    let mut mcts_exploration = 700.0;
+    let mut mcts_simulations = 2048;
+    let mut mcts_exploration = 550.0;
     let mut mcts_prior = MctsPrior::Connectivity;
     let mut mcts_early_prior = MctsPrior::Connectivity;
     let mut mcts_rollout_depth = 0;
     let mut mcts_rollout_cutoff_until = CANDY_COUNT;
-    let mut mcts_tail_repair_turns = 2;
+    let mut mcts_tail_repair_turns = 3;
     let mut mcts_tail_repair_passes = 1;
     let mut mcts_early_simulations = 0;
     let mut mcts_early_min_gain = 20.0;
