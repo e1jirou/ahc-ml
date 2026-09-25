@@ -65,7 +65,6 @@ from examples.ahc015.python.model import (
     STUDENT_PARAMETER_COUNT,
     STUDENT_RESIDUAL_BLOCKS,
     TEACHER_PARAMETER_COUNT,
-    TEACHER_RESIDUAL_BLOCKS,
     Ahc015PpoNet,
     Ahc015ValueNet,
     parameter_count,
@@ -225,14 +224,14 @@ def test_config_and_ppo_model_shapes() -> None:
     assert ppo_config.training.batch_size == 1024
     assert ppo_config.training.micro_batch_size == 512
     assert ppo_config.training.rollout_processes == 2
-    assert ppo_config.training.learning_rate == 2.5e-4
+    assert ppo_config.training.learning_rate == 1.5e-4
     assert ppo_config.ppo.gamma == 1.0
     assert distill_config.training.data_parallel
     assert distill_config.training.rollout_processes == 2
     assert distill_config.run.name_prefix == "distill"
     continue_config = load_config(config_directory / "config_ppo.toml")
     assert continue_config.run.name_prefix == "large"
-    assert continue_config.run.seed == 15047
+    assert continue_config.run.seed == 15053
     assert continue_config.run.device == "cuda"
     assert continue_config.model.input_mode == "afterstate"
     assert continue_config.model.future_mode == "none"
@@ -244,7 +243,7 @@ def test_config_and_ppo_model_shapes() -> None:
     assert continue_config.training.rollout_processes == 2
     assert continue_config.training.batch_size == 1024
     assert continue_config.training.micro_batch_size == 512
-    assert continue_config.training.learning_rate == pytest.approx(2.5e-4)
+    assert continue_config.training.learning_rate == pytest.approx(1.5e-4)
     assert continue_config.ppo.entropy_coefficient == pytest.approx(0.01)
     assert continue_config.ppo.policy_phi_coefficient_start == 0.0
     assert continue_config.ppo.policy_phi_coefficient_end == 0.0
