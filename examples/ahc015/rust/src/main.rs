@@ -64,6 +64,12 @@ enum MctsPrior {
     TinyNn,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum MctsRootBackup {
+    Playout,
+    Decision,
+}
+
 struct SearchSettings {
     exact_turns: usize,
     mc_turns: usize,
@@ -84,6 +90,7 @@ struct SearchSettings {
     mcts_tail_repair_passes: usize,
     mcts_early_simulations: u64,
     mcts_early_min_gain: f64,
+    mcts_root_backup: MctsRootBackup,
     time_limit: Duration,
     time_reserve: Duration,
 }
@@ -145,6 +152,7 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
     let mut mcts_tail_repair_passes = 1;
     let mut mcts_early_simulations = 0;
     let mut mcts_early_min_gain = 20.0;
+    let mut mcts_root_backup = MctsRootBackup::Decision;
     let mut time_limit_ms = 1400;
     let mut time_reserve_ms = 300;
     while let Some(argument) = arguments.next() {
@@ -282,6 +290,13 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
                     return Err("--mcts-early-min-gain must be nonnegative".to_string());
                 }
             }
+            "--mcts-root-backup" => {
+                mcts_root_backup = match arguments.next().as_deref() {
+                    Some("playout") => MctsRootBackup::Playout,
+                    Some("decision") => MctsRootBackup::Decision,
+                    _ => return Err("--mcts-root-backup must be playout or decision".to_string()),
+                };
+            }
             "--time-limit-ms" => {
                 time_limit_ms = parse_next(&mut arguments, "--time-limit-ms")?;
             }
@@ -324,6 +339,7 @@ fn load_model() -> Result<(Option<Ahc015ValueNet>, SearchSettings), String> {
             mcts_tail_repair_passes,
             mcts_early_simulations,
             mcts_early_min_gain,
+            mcts_root_backup,
             time_limit: Duration::from_millis(time_limit_ms),
             time_reserve: Duration::from_millis(time_reserve_ms),
         },
@@ -508,28 +524,62 @@ fn mcts_action(
             break;
         }
     }
+    let root_values: [f64; ACTION_COUNT] = std::array::from_fn(|action| {
+        if visits[action] == 0 {
+            return f64::NEG_INFINITY;
+        }
+        let playout_mean = sums[action] as f64 / visits[action] as f64;
+        if settings.mcts_root_backup == MctsRootBackup::Playout {
+            return playout_mean;
+        }
+        mcts_decision_backup(&candidates[action], placed, input, playout_mean, &table)
+    });
     let best_action = roots
         .iter()
         .copied()
         .filter(|&action| visits[action] > 0)
         .max_by(|&left, &right| {
-            let left_scaled = sums[left] as u128 * visits[right] as u128;
-            let right_scaled = sums[right] as u128 * visits[left] as u128;
-            left_scaled
-                .cmp(&right_scaled)
+            root_values[left]
+                .total_cmp(&root_values[right])
                 .then_with(|| right.cmp(&left))
         })
         .unwrap_or(model_action);
     if visits[best_action] == 0 || visits[model_action] == 0 {
         return model_action;
     }
-    let best_mean = sums[best_action] as f64 / visits[best_action] as f64;
-    let model_mean = sums[model_action] as f64 / visits[model_action] as f64;
+    let best_mean = root_values[best_action];
+    let model_mean = root_values[model_action];
     if best_mean >= model_mean + min_gain {
         best_action
     } else {
         model_action
     }
+}
+
+fn mcts_decision_backup(
+    root: &Board,
+    placed: usize,
+    input: &Input,
+    fallback: f64,
+    table: &MctsTable,
+) -> f64 {
+    let empty_count = CANDY_COUNT - placed;
+    let flavor = input.flavors()[placed];
+    let mut sum = 0.0;
+    for rank in 1..=empty_count {
+        let board = place_on_board_at_rank(root, rank, flavor);
+        let Some(node) = table.get(&board) else {
+            sum += fallback;
+            continue;
+        };
+        let best = (0..ACTION_COUNT)
+            .filter(|&action| node.action_visits[action] > 0)
+            .map(|action| node.action_sums[action] as f64 / node.action_visits[action] as f64)
+            .max_by(f64::total_cmp)
+            .unwrap_or(fallback);
+        sum += best;
+    }
+    sum / empty_count as f64
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1269,6 +1319,7 @@ mod tests {
             mcts_tail_repair_passes: 1,
             mcts_early_simulations: 0,
             mcts_early_min_gain: 20.0,
+            mcts_root_backup: MctsRootBackup::Playout,
             time_limit: Duration::from_secs(2),
             time_reserve: Duration::from_millis(100),
         };
@@ -1311,6 +1362,24 @@ mod tests {
         assert_eq!(table[&board].visits, 2);
         assert_eq!(table[&board].action_visits[LEFT], 2);
         assert_eq!(table[&board].action_sums[LEFT], 444);
+    }
+
+    #[test]
+    fn mcts_root_backup_averages_best_values_over_next_placements() {
+        let input = Input::new([1; CANDY_COUNT]);
+        let mut root = [1; CANDY_COUNT];
+        root[98..].fill(0);
+        let first = place_on_board_at_rank(&root, 1, 1);
+        let second = place_on_board_at_rank(&root, 2, 1);
+        let mut table = MctsTable::default();
+        for (board, best_sum, best_visits) in [(first, 200, 2), (second, 90, 1)] {
+            let mut node = new_mcts_node(&board, MctsPrior::Uniform, &input, 99);
+            node.visits = best_visits;
+            node.action_visits[FRONT] = best_visits;
+            node.action_sums[FRONT] = best_sum;
+            table.insert(board, node);
+        }
+        assert_eq!(mcts_decision_backup(&root, 98, &input, 0.0, &table), 95.0);
     }
 
     #[test]

@@ -38,6 +38,7 @@ PYTHONPATH=python .venv/bin/python -m examples.ahc015.python.evaluate \
 93手目以降に7手の厳密 expectimax を使う。詳細と検証結果は `docs/solution.md` を参照する。
 MCTSは盤面hashで同一局面をDAGへ統合し、直後2配置のrank組を層化する。展開時は24ルールでplayoutし、
 手のpriorには局所連結度の順位を使う。playout後は末尾3方向を後ろから局所的に修正する。
+根の候補比較では、次の各配置rankに対応する決定ノードの最良平均価値を一様平均して1段backupする。
 構造特徴を128 channel actorから蒸留する小型NN priorも実験可能だが、評価では改善しなかったため提出設定では
 使用しない。
 
@@ -49,6 +50,15 @@ PYTHONPATH=python .venv/bin/python -m examples.ahc015.python.export \
   --rust-output examples/ahc015/rust/src/generated_model.rs
 cargo build --release -p ahc015-inference
 scripts/build_submit.sh examples/ahc015/rust/src/main.rs outputs/ahc015/submit.rs
+```
+
+学習系依存を入れずに、Rust提出器の旧・新設定を同一ケースで比較することもできる。
+
+```bash
+python3 examples/ahc015/python/evaluate_rust_stdlib.py \
+  --executable target/release/ahc015-inference --episodes 300 \
+  --baseline-args '--mcts-root-backup playout' \
+  --candidate-args '--mcts-root-backup decision'
 ```
 
 ## 検証
