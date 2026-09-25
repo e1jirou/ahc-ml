@@ -206,6 +206,8 @@ afterstate版は16,656.832点高く、固定512ケースのbestでもpre-tilt版
   `--exact-turns 0`でそれぞれ無効化できる。
 - future rank列とルールの行動列を事前計算し、終端連結度は3味の`u128` bitboard flood fillで求める。
   旧モンテカルロ法は比較用に`--endgame-search mc`で残す。
+- MCTSのpathと末尾修正盤面のbufferはsimulation間で再利用し、DAG nodeの検索・挿入はentry APIによる
+  1回のhash lookupで行う。
 - 根の集計は`--mcts-root-backup playout`で従来の単純平均へ戻せる。提出時のデフォルトは`decision`である。
 
 ## 実装上の確認事項

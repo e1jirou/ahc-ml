@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
         description="Evaluate two AHC015 Rust solver settings without third-party packages"
     )
     parser.add_argument("--executable", type=Path, required=True)
+    parser.add_argument("--candidate-executable", type=Path)
     parser.add_argument("--episodes", type=int, default=300)
     parser.add_argument("--seed", type=int, default=515015)
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
@@ -121,7 +122,7 @@ def run_solver(
         raise RuntimeError("solver did not emit exactly 100 valid actions")
 
     board = [0] * CELL_COUNT
-    for flavor, rank, action in zip(flavors, ranks, actions):
+    for flavor, rank, action in zip(flavors, ranks, actions, strict=True):
         place_at_rank(board, rank, flavor)
         board = tilt(board, ACTIONS[action])
     totals = [flavors.count(flavor) for flavor in range(1, 4)]
@@ -145,16 +146,26 @@ def main() -> None:
     if args.episodes < 2 or args.workers <= 0 or args.timeout <= 0:
         raise ValueError("episodes must be at least 2 and workers/timeout must be positive")
     executable = args.executable.resolve()
+    candidate_executable = (
+        executable if args.candidate_executable is None else args.candidate_executable.resolve()
+    )
     baseline_args = shlex.split(args.baseline_args)
     candidate_args = None if args.candidate_args is None else shlex.split(args.candidate_args)
+    candidate_enabled = args.candidate_executable is not None or candidate_args is not None
     case_seeds = [args.seed + index for index in range(args.episodes)]
 
     def evaluate(case_seed: int) -> tuple[tuple[int, float], tuple[int, float] | None]:
         flavors, ranks = generate_case(case_seed)
         baseline = run_solver(executable, baseline_args, flavors, ranks, args.timeout)
         candidate = None
-        if candidate_args is not None:
-            candidate = run_solver(executable, candidate_args, flavors, ranks, args.timeout)
+        if candidate_enabled:
+            candidate = run_solver(
+                candidate_executable,
+                candidate_args or [],
+                flavors,
+                ranks,
+                args.timeout,
+            )
         return baseline, candidate
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -166,18 +177,20 @@ def main() -> None:
         "episodes": args.episodes,
         "seed": args.seed,
         "workers": args.workers,
+        "baseline_executable": str(executable),
         "baseline_args": baseline_args,
         "baseline": summary(baseline_scores, baseline_times),
     }
-    if candidate_args is not None:
+    if candidate_enabled:
         candidate_scores = [result[1][0] for result in results if result[1] is not None]
         candidate_times = [result[1][1] for result in results if result[1] is not None]
         differences = [
             candidate - baseline
-            for candidate, baseline in zip(candidate_scores, baseline_scores)
+            for candidate, baseline in zip(candidate_scores, baseline_scores, strict=True)
         ]
         report.update(
             {
+                "candidate_executable": str(candidate_executable),
                 "candidate_args": candidate_args,
                 "candidate": summary(candidate_scores, candidate_times),
                 "paired": {

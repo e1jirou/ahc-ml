@@ -3,7 +3,7 @@ mod game;
 mod generated_mcts_prior;
 mod generated_model;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, hash_map::Entry};
 use std::env;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, BufRead, Write};
@@ -491,6 +491,8 @@ fn mcts_action(
     let mut sums = [0u64; ACTION_COUNT];
     let mut visits = [0u32; ACTION_COUNT];
     let mut simulation = 0u64;
+    let mut path = Vec::<(Board, usize)>::with_capacity(CANDY_COUNT);
+    let mut boards_before_action = Vec::<Board>::with_capacity(settings.mcts_tail_repair_turns);
     'search: loop {
         // One common random stream and rollout rule is applied to every root action.
         let ranks = playout_ranks(placed, simulation, settings.mc_stratified_turns);
@@ -512,6 +514,8 @@ fn mcts_action(
                 },
                 settings.mcts_tail_repair_passes,
                 &mut table,
+                &mut path,
+                &mut boards_before_action,
             );
             sums[root] += score as u64;
             visits[root] += 1;
@@ -595,24 +599,32 @@ fn mcts_simulation(
     tail_repair_turns: usize,
     tail_repair_passes: usize,
     table: &mut MctsTable,
+    path: &mut Vec<(Board, usize)>,
+    boards_before_action: &mut Vec<Board>,
 ) -> usize {
     let mut board = *root;
-    let mut path = [([0; CANDY_COUNT], 0); CANDY_COUNT];
-    for (depth, position) in (placed..CANDY_COUNT).enumerate() {
+    path.clear();
+    for position in placed..CANDY_COUNT {
         board = place_on_board_at_rank(&board, ranks[position] as usize, input.flavors()[position]);
         if position + 1 == CANDY_COUNT {
             let score = connectivity_numerator(&board);
-            mcts_backpropagate(table, &path[..depth], score);
+            mcts_backpropagate(table, path, score);
             return score;
         }
 
-        let is_new = !table.contains_key(&board);
-        if is_new {
-            table.insert(board, new_mcts_node(&board, prior, input, position + 1));
-        }
-        let action = select_mcts_action(table.get(&board).unwrap(), exploration);
-        let edge_unvisited = table.get(&board).unwrap().action_visits[action] == 0;
-        path[depth] = (board, action);
+        let (is_new, action, edge_unvisited) = match table.entry(board) {
+            Entry::Occupied(entry) => {
+                let node = entry.get();
+                let action = select_mcts_action(node, exploration);
+                (false, action, node.action_visits[action] == 0)
+            }
+            Entry::Vacant(entry) => {
+                let node = entry.insert(new_mcts_node(&board, prior, input, position + 1));
+                let action = select_mcts_action(node, exploration);
+                (true, action, true)
+            }
+        };
+        path.push((board, action));
         board = tilt(&board, action);
         if is_new || edge_unvisited {
             let score = rule_playout_after_tilt(
@@ -624,8 +636,9 @@ fn mcts_simulation(
                 rollout_depth,
                 tail_repair_turns,
                 tail_repair_passes,
+                boards_before_action,
             );
-            mcts_backpropagate(table, &path[..=depth], score);
+            mcts_backpropagate(table, path, score);
             return score;
         }
     }
@@ -986,6 +999,7 @@ fn rule_playout_after_tilt(
     rollout_depth: usize,
     tail_repair_turns: usize,
     tail_repair_passes: usize,
+    boards_before_action: &mut Vec<Board>,
 ) -> usize {
     if tail_repair_turns <= 1 {
         return rule_playout_after_tilt_legacy(
@@ -1006,7 +1020,6 @@ fn rule_playout_after_tilt(
     let terminal = last_action == CANDY_COUNT - 2;
     let mut repaired_actions = *actions;
     let repair_start = placed.max((last_action + 1).saturating_sub(tail_repair_turns));
-    let mut boards_before_action = Vec::with_capacity(last_action + 1 - repair_start);
     let mut best_score = 0;
 
     for pass in 0..tail_repair_passes {
@@ -1389,8 +1402,9 @@ mod tests {
         board[..80].fill(1);
         let actions = [FRONT as u8; CANDY_COUNT];
         let ranks = [1; CANDY_COUNT];
+        let mut scratch = Vec::new();
         assert_eq!(
-            rule_playout_after_tilt(&board, 80, &input, &actions, &ranks, 4, 0, 1),
+            rule_playout_after_tilt(&board, 80, &input, &actions, &ranks, 4, 0, 1, &mut scratch,),
             10_000
         );
     }
@@ -1404,8 +1418,11 @@ mod tests {
         }
         let actions = std::array::from_fn(|index| (index % ACTION_COUNT) as u8);
         let ranks = [1; CANDY_COUNT];
-        let one = rule_playout_after_tilt(&board, 94, &input, &actions, &ranks, 0, 1, 1);
-        let four = rule_playout_after_tilt(&board, 94, &input, &actions, &ranks, 0, 4, 1);
+        let mut scratch = Vec::new();
+        let one =
+            rule_playout_after_tilt(&board, 94, &input, &actions, &ranks, 0, 1, 1, &mut scratch);
+        let four =
+            rule_playout_after_tilt(&board, 94, &input, &actions, &ranks, 0, 4, 1, &mut scratch);
         assert!(four >= one);
     }
 
